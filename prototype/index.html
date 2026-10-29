@@ -1,0 +1,978 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>记账本 · 项目导览</title>
+<style>
+  :root {
+    --bg:      var(--dsw-alias-bg-base, #131417);
+    --layer1:  var(--dsw-alias-bg-layer-1, #191b1f);
+    --layer2:  var(--dsw-alias-bg-layer-2, #202329);
+    --border:  var(--dsw-alias-border-l1, #2a2d34);
+    --border2: var(--dsw-alias-border-l2, #3a3f48);
+    --text:    var(--dsw-alias-label-primary, #e9ebee);
+    --muted:   var(--dsw-alias-label-secondary, #9aa1ab);
+    --brand:   var(--dsw-alias-brand-primary, #5b8cff);
+    --ok:      var(--dsw-alias-state-success-primary, #3fb950);
+    --warn:    var(--dsw-alias-state-warn-primary, #d29922);
+    --danger:  var(--dsw-alias-state-error-primary, #f85149);
+    --idle:    var(--dsw-alias-state-idle-primary, #6b7280);
+    --rail:    var(--dsw-specific-sidebar-fill, #0f1013);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:      var(--dsw-alias-bg-base, #ffffff);
+      --layer1:  var(--dsw-alias-bg-layer-1, #f7f8fa);
+      --layer2:  var(--dsw-alias-bg-layer-2, #eef0f4);
+      --border:  var(--dsw-alias-border-l1, #e3e6eb);
+      --border2: var(--dsw-alias-border-l2, #cdd2da);
+      --text:    var(--dsw-alias-label-primary, #1a1d21);
+      --muted:   var(--dsw-alias-label-secondary, #5f6670);
+      --brand:   var(--dsw-alias-brand-primary, #2f6bff);
+      --ok:      var(--dsw-alias-state-success-primary, #1a7f37);
+      --warn:    var(--dsw-alias-state-warn-primary, #9a6700);
+      --danger:  var(--dsw-alias-state-error-primary, #c3281f);
+      --idle:    var(--dsw-alias-state-idle-primary, #8b929c);
+      --rail:    var(--dsw-specific-sidebar-fill, #f4f5f7);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  button { font: inherit; color: inherit; }
+
+  .app { display: grid; grid-template-columns: 252px 1fr; height: 100vh; }
+
+  /* ---------- left rail ---------- */
+  .rail {
+    background: var(--rail);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .rail-head { padding: 18px 16px 12px; border-bottom: 1px solid var(--border); }
+  .proj { font-size: 14px; font-weight: 600; letter-spacing: .01em; }
+  .proj-sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  .tree { flex: 1; overflow: auto; padding: 10px 8px 24px; }
+  .group-label {
+    font-size: 11px; color: var(--idle); letter-spacing: .06em;
+    padding: 16px 10px 6px;
+  }
+  .ti {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 10px; border-radius: 6px;
+    font-size: 13px; color: var(--muted); cursor: pointer; user-select: none;
+    white-space: nowrap;
+  }
+  .ti:hover { background: var(--layer2); color: var(--text); }
+  .ti.on { background: var(--layer2); color: var(--text); }
+  .ti .nm { overflow: hidden; text-overflow: ellipsis; }
+  .ti .cnt { margin-left: auto; font-size: 11px; color: var(--idle); font-variant-numeric: tabular-nums; }
+  .ti .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--ok); flex: none; }
+  .ti.lvl1 { padding-left: 22px; }
+  .ti.ghost { color: var(--idle); }
+  .rain-foot { padding: 12px 16px; border-top: 1px solid var(--border); font-size: 11px; color: var(--idle); line-height: 1.5; }
+
+  /* ---------- main ---------- */
+  .main { overflow-y: auto; overflow-x: hidden; scroll-behavior: smooth; }
+  .topbar {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; gap: 14px;
+    padding: 13px 34px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  .status { font-size: 12px; color: var(--muted); }
+  .status b { color: var(--text); font-weight: 500; }
+  .spacer { flex: 1; }
+  .btn {
+    border: 1px solid var(--border2); background: transparent;
+    color: var(--muted); border-radius: 7px; padding: 5px 11px;
+    font-size: 12.5px; cursor: pointer;
+  }
+  .btn:hover { color: var(--text); border-color: var(--idle); }
+  .btn.primary { color: var(--text); border-color: var(--border2); }
+
+  .content { max-width: 830px; padding: 30px 34px 96px; }
+
+  /* ---------- overview ---------- */
+  .eyebrow { font-size: 12px; color: var(--idle); letter-spacing: .08em; }
+  h1 { font-size: 26px; line-height: 1.35; margin: 8px 0 6px; font-weight: 600; letter-spacing: -.01em; }
+  .lede { color: var(--muted); font-size: 14.5px; }
+  .what { margin: 22px 0 0; }
+  .what p { margin: 0 0 10px; font-size: 15px; line-height: 1.85; color: var(--text); }
+  .what p:last-child { color: var(--muted); }
+
+  .sec-h {
+    display: flex; align-items: baseline; gap: 10px;
+    margin: 40px 0 16px;
+  }
+  .sec-h h2 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .01em; }
+  .sec-h span { font-size: 12px; color: var(--idle); }
+
+  .blocks { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+  .blk {
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 15px 13px; background: var(--layer1);
+    cursor: pointer; transition: border-color .15s, transform .15s, background .15s;
+    position: relative;
+  }
+  .blk:hover { border-color: var(--border2); background: var(--layer2); transform: translateY(-1px); }
+  .blk-top { display: flex; align-items: center; gap: 8px; }
+  .blk-name { font-size: 13.5px; font-weight: 600; }
+  .blk-tag {
+    margin-left: auto; font-size: 10.5px; color: var(--idle);
+    border: 1px solid var(--border); border-radius: 20px; padding: 1px 7px;
+  }
+  .blk-line { font-size: 12.5px; color: var(--muted); margin-top: 7px; line-height: 1.6; }
+  .dot-ok { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); flex: none; }
+  .dot-open { width: 6px; height: 6px; border-radius: 50%; background: var(--idle); flex: none; }
+
+  .route { list-style: none; padding: 0; margin: 0; counter-reset: r; }
+  .route li {
+    display: flex; gap: 14px; padding: 13px 0;
+    border-bottom: 1px dashed var(--border);
+  }
+  .route li:last-child { border-bottom: 0; }
+  .rnum {
+    width: 22px; height: 22px; flex: none; border-radius: 50%;
+    border: 1px solid var(--border2); color: var(--muted);
+    font-size: 11.5px; display: grid; place-items: center;
+    font-variant-numeric: tabular-nums; margin-top: 1px;
+  }
+  .rtitle { font-size: 14px; }
+  .rfile {
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 12px; color: var(--brand);
+    background: color-mix(in srgb, var(--brand) 12%, transparent);
+    border-radius: 4px; padding: 1px 5px;
+  }
+  .rwhy { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+
+  details.ignore {
+    border: 1px solid var(--border); border-radius: 10px;
+    background: var(--layer1); overflow: hidden;
+  }
+  details.ignore summary {
+    cursor: pointer; padding: 13px 16px; font-size: 13.5px; list-style: none;
+    display: flex; align-items: center; gap: 10px;
+  }
+  details.ignore summary::-webkit-details-marker { display: none; }
+  details.ignore summary::before { content: "▸"; color: var(--idle); font-size: 11px; }
+  details.ignore[open] summary::before { content: "▾"; }
+  .ig-list { padding: 2px 16px 14px 38px; }
+  .ig-row { display: flex; gap: 12px; padding: 5px 0; font-size: 13px; }
+  .ig-row code {
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    color: var(--muted); min-width: 118px;
+  }
+  .ig-row span { color: var(--idle); font-size: 12.5px; }
+
+  .fineprint { margin-top: 44px; font-size: 11.5px; color: var(--idle); line-height: 1.8; }
+
+  /* ---------- folder card ---------- */
+  .crumb { font-size: 12px; color: var(--idle); font-family: ui-monospace, Consolas, monospace; }
+  .crumb b { color: var(--muted); font-weight: 400; }
+
+  .segs {
+    display: inline-flex; padding: 3px; gap: 2px; margin: 16px 0 0;
+    background: var(--layer1); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .segs button {
+    border: 0; background: transparent; color: var(--muted);
+    padding: 5px 12px; border-radius: 6px; font-size: 12.5px; cursor: pointer;
+  }
+  .segs button:hover { color: var(--text); }
+  .segs button.on { background: var(--layer2); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+
+  .card { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 22px; }
+  .prose { font-size: 14.5px; line-height: 1.9; margin: 0 0 16px; }
+  .say {
+    margin: 16px 0 0; padding-left: 14px;
+    border-left: 2px solid var(--border2);
+    color: var(--muted); font-size: 14px; line-height: 1.85;
+  }
+  .kv { margin: 0; padding: 0; list-style: none; }
+  .kv li { display: flex; gap: 10px; padding: 7px 0; border-bottom: 1px dashed var(--border); font-size: 14px; line-height: 1.7; }
+  .kv li:last-child { border-bottom: 0; }
+  .kv .k { color: var(--idle); font-size: 12.5px; min-width: 56px; padding-top: 3px; flex: none; }
+  .kv .v { color: var(--text); }
+
+  .effect {
+    margin-top: 22px; border: 1px solid var(--border); border-radius: 10px;
+    background: var(--layer1); padding: 14px 16px;
+  }
+  .effect-h { display: flex; align-items: center; gap: 9px; font-size: 12.5px; color: var(--muted); }
+  .pill {
+    font-size: 11.5px; border-radius: 20px; padding: 2px 9px; border: 1px solid transparent;
+  }
+  .pill.safe    { color: var(--ok);     background: color-mix(in srgb, var(--ok) 14%, transparent); }
+  .pill.careful { color: var(--warn);   background: color-mix(in srgb, var(--warn) 14%, transparent); }
+  .pill.risky   { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, transparent); }
+  .effect p { margin: 9px 0 0; font-size: 13.5px; color: var(--muted); line-height: 1.75; }
+
+  .rel { margin-top: 24px; }
+  .rel-h { font-size: 12.5px; color: var(--idle); margin-bottom: 9px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 3px 8px; color: var(--muted); background: var(--layer1);
+  }
+
+  .deeper { margin-top: 26px; border-top: 1px solid var(--border); padding-top: 18px; }
+  .deep-row { display: flex; gap: 12px; padding: 9px 0; align-items: flex-start; }
+  .deep-k {
+    flex: none; width: 54px; font-size: 11.5px; color: var(--idle);
+    padding-top: 2px; text-align: right;
+  }
+  .deep-v { font-size: 13.5px; color: var(--text); line-height: 1.7; }
+  .deep-v code {
+    font-family: ui-monospace, Consolas, monospace; font-size: 12.5px;
+    color: var(--brand);
+  }
+  .deep-v .ask {
+    display: block; color: var(--muted); font-size: 13px; margin-top: 2px;
+  }
+
+  .card-foot { display: flex; gap: 8px; margin-top: 30px; flex-wrap: wrap; }
+  .foot-btn {
+    border: 1px solid var(--border2); background: transparent; color: var(--muted);
+    border-radius: 7px; padding: 6px 12px; font-size: 12.5px; cursor: pointer;
+  }
+  .foot-btn:hover { color: var(--text); border-color: var(--idle); }
+  .foot-btn.done { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+
+  .known-box {
+    margin-top: 18px; border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; background: var(--layer1);
+    display: flex; align-items: center; gap: 12px; font-size: 13.5px; color: var(--muted);
+  }
+  .known-box b { color: var(--text); font-weight: 500; }
+
+  .correct {
+    margin-top: 14px; border: 1px solid var(--border); border-radius: 10px;
+    background: var(--layer1); padding: 12px 14px; display: none;
+  }
+  .correct.open { display: block; }
+  .correct textarea {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 8px 10px; font: inherit; font-size: 13px; resize: vertical; min-height: 58px;
+    outline: none;
+  }
+  .correct textarea:focus { border-color: var(--brand); }
+  .correct-bar { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+  .correct-note { font-size: 11.5px; color: var(--idle); }
+  .toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translate(-50%, 12px);
+    background: var(--layer2); border: 1px solid var(--border2);
+    color: var(--text); font-size: 13px; padding: 9px 16px; border-radius: 8px;
+    opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s;
+  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  .fact-flag {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; color: var(--idle); margin-left: 8px;
+  }
+  @media (max-width: 760px) {
+    .app { grid-template-columns: 1fr; }
+    .rail { display: none; }
+    .content, .topbar { padding-left: 18px; padding-right: 18px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="rail-head">
+      <div class="proj">记账本</div>
+      <div class="proj-sub">个人记账网页 · 本地运行</div>
+    </div>
+    <nav class="tree" id="tree"></nav>
+    <div class="rain-foot">看懂的地方会自己安静下来，<br>不懂的随时可以再问。</div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div class="status" id="status"></div>
+      <div class="spacer"></div>
+      <button class="btn" data-action="refresh">重新读一遍代码</button>
+    </div>
+    <div class="content" id="view"></div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ============================================================
+     假数据：一个虚构的「记账本」项目。
+     真实版本里，下面「事实」字段由工具从代码算出来，
+     「人话」字段由 AI 读完代码后写，并标注 AI 的理解。
+     ============================================================ */
+
+  const PROJECT = {
+    name: "记账本",
+    status: "地图生成于 2 分钟前 · 42 个文件 · 6 个区域",
+    what: [
+      "这是一个在浏览器里用的记账工具。记一笔支出，它帮你分类，再按月算占比。",
+      "现在能做三件事：记一笔、看流水、看月度饼图。数据存在你自己的电脑上。",
+      "还没做：多人共享、导出 Excel、手机端适配。"
+    ],
+    blocks: [
+      { id: "entry",      name: "入口",   tag: "1 个文件", line: "整个网站从这里开始跑起来，几十行，基本不用改。", known: true },
+      { id: "pages",      name: "页面",   tag: "3 个文件", line: "你真正看到的三屏：记账、流水、统计。",       known: true },
+      { id: "components", name: "零件",   tag: "8 个文件", line: "按钮、卡片、日期选择器，做好放在这，页面拿去用。", known: true },
+      { id: "store",      name: "数据",   tag: "2 个文件", line: "账目的保管员：规定一笔账长什么样，负责存取。", known: false },
+      { id: "server",     name: "后端",   tag: "2 个文件", line: "一个很小的柜台，把账目写进数据库再读出来。",   known: false },
+      { id: "styles",     name: "样子",   tag: "2 个文件", line: "全站的配色、字号、间距都定在这。",             known: false }
+    ],
+    route: [
+      { file: "index.html", why: "先看它怎么把整个程序启动起来。只有十几行，像钥匙孔。" },
+      { file: "src/pages/Add.jsx", why: "你最常用的「记一笔」就是这一页，看完就懂一半了。" },
+      { file: "src/store/records.js", why: "数据怎么写进去、怎么取出来。看懂这块，你就知道改哪儿会连累哪儿。" }
+    ],
+    ignore: [
+      { name: "package.json", why: "给工具看的清单，写着用到哪些现成的库。想加新功能时才需要碰。" },
+      { name: "node_modules/", why: "别人写好的库都下载在这里，几万个文件。永远不用打开。" },
+      { name: "dist/",         why: "打包后生成的成品，每次运行自动重建。改了也会被覆盖。" },
+      { name: "vite.config.js", why: "启动工具的设置，只有一个字段有用：端口号。" },
+      { name: ".gitignore",    why: "告诉 Git 哪些文件别存进历史。" }
+    ]
+  };
+
+  const CARDS = {
+    entry: {
+      path: "index.html",
+      title: "整个网站的入口",
+      sub: "一切从这里开始",
+      count: 1,
+      depth: {
+        plain: {
+          lead: "整个网站是从这一个文件开始跑起来的。它不画界面，只做一件事：把真正的程序（src/main.js）加载进来。",
+          say: "打比方：像大门的钥匙孔。插对了，整栋楼的灯才会亮。",
+          effect: "改错了会整个页面白屏，而且看不出是哪里错。这里适合“照着改”，不适合自由发挥。",
+          safety: "risky"
+        },
+        structured: {
+          lead: "职责：提供挂载点，按顺序引入样式和入口脚本。",
+          points: [
+            { k: "职责", v: "声明页面结构（一个空的 div）并加载构建后的脚本。" },
+            { k: "边界", v: "不含任何业务逻辑，也不该出现具体样式。" },
+            { k: "影响", v: "改动会作用于全部页面，因为它是唯一的 HTML 宿主。" }
+          ],
+          effect: "这一层的错误通常是“整页空白”：脚本加载顺序、路径大小写都会导致它。",
+          safety: "risky"
+        },
+        code: {
+          lead: "1 个文件，14 行。它只做三件事：定语言、给挂载点、引脚本。",
+          points: [
+            { k: "事实", v: "被浏览器直接请求，不经打包；引用的 /src/main.js 由 Vite 在开发时注入。" },
+            { k: "事实", v: "全项目只有这里出现 &lt;div id=\"root\"&gt;，React 的挂载点就是它。" },
+            { k: "判断", v: "没有业务逻辑依赖它，所以它坏了不会是“某个功能坏”，而是“全站白屏”。" }
+          ],
+          effect: "这一层的错误通常是“整页空白”：脚本加载顺序、路径大小写都会导致它。",
+          safety: "risky"
+        }
+      },
+      relatedLabel: "它和谁连着",
+      related: ["src/main.js", "src/App.jsx", "public/favicon.ico"],
+      deeper: {
+        search: "单页应用的入口文件是怎么工作的",
+        read: "index.html（14 行，是全项目最短的文件）",
+        ask: "这个 index.html 里的 div 和 main.js 是怎么接上的？"
+      }
+    },
+
+    pages: {
+      path: "src/pages",
+      title: "你看到的三个页面",
+      sub: "记账 · 流水 · 统计",
+      count: 3,
+      depth: {
+        plain: {
+          lead: "这里放着你真正看到的三个页面。一个文件就是一屏：摆什么、点了去哪儿，都在这写。",
+          say: "打比方：像一本书的三个章节。每章各管一段，翻到哪章由链接决定。",
+          effect: "改这里会马上看见变化，三个页面互相独立，改坏一个不影响另外两个。",
+          safety: "careful"
+        },
+        structured: {
+          lead: "职责：组织一屏的内容——放哪些零件、从哪种数据取数、按钮点了跳哪里。",
+          points: [
+            { k: "职责", v: "页面级容器：布局 + 取数 + 事件分发。" },
+            { k: "边界", v: "不直接存数据，也不做统计计算；这些都在 store 里。" },
+            { k: "数据流", v: "store → pages → components，单向。页面之间不互相引用。" }
+          ],
+          effect: "三个页面各约 120 行，彼此没有 import 关系，改动影响范围基本限定在当前页。",
+          safety: "careful"
+        },
+        code: {
+          lead: "3 个文件。Add.jsx 引用了 components 里的 DatePicker 和 AmountInput；Stats.jsx 引入了图表库。三者之间没有互相引用。",
+          points: [
+            { k: "事实", v: "Home.jsx / Add.jsx / Stats.jsx，分别约 96 / 132 / 118 行。" },
+            { k: "事实", v: "共用 store/records.js 的 4 个导出函数中的 3 个。" },
+            { k: "判断", v: "页面层没有反向依赖，所以在这一层做实验是安全的：最坏情况只坏一屏。" }
+          ],
+          effect: "三个页面各约 120 行，彼此没有 import 关系，改动影响范围基本限定在当前页。",
+          safety: "careful"
+        }
+      },
+      relatedLabel: "它和谁连着",
+      related: ["src/main.js（注册路由）", "src/components/", "src/store/records.js"],
+      deeper: {
+        search: "单页应用的路由是怎么工作的",
+        read: "src/pages/Add.jsx（最短的一页，最好懂）",
+        ask: "我想在记账页加一个“备注”输入框，应该改哪个文件、改哪几行？"
+      }
+    },
+
+    components: {
+      path: "src/components",
+      title: "页面上的零件",
+      sub: "按钮、卡片、弹窗都住这",
+      count: 8,
+      depth: {
+        plain: {
+          lead: "这里放着页面上的零件：按钮、卡片、弹窗、日期选择器。它们不负责记账，只负责长什么样、点了有什么反应。",
+          say: "打比方：像装修时的家具间。沙发、柜子提前做好，哪个房间要用就搬过去。",
+          effect: "只影响样子和点击手感，不会动到账目数据。这是整个项目里最安全的地方。",
+          safety: "safe"
+        },
+        structured: {
+          lead: "职责：纯展示组件。接收数据，渲染结果，把用户操作通过回调交还给页面。",
+          points: [
+            { k: "职责", v: "可复用的界面单元，每个文件对应一件事。" },
+            { k: "边界", v: "不碰数据、不发请求、不知道自己在哪一页。" },
+            { k: "数据流", v: "页面传 props 进来，用户操作回调出去；单向，不回写。" }
+          ],
+          effect: "只影响渲染结果，不改变数据流。改坏最多是某个零件变形，不会丢数据。",
+          safety: "safe"
+        },
+        code: {
+          lead: "8 个文件。Button.jsx 被 3 个页面引用；DatePicker.jsx 只出现在 Add.jsx。",
+          points: [
+            { k: "事实", v: "components 没有 import 任何 pages 或 store 的文件，层级是干净的。" },
+            { k: "事实", v: "Button.jsx 的导出被 3 处使用，是这里被复用最多的零件。" },
+            { k: "判断", v: "没有反向依赖，所以这一层可以随便试；唯一的连锁是“谁在用这个零件”。" }
+          ],
+          effect: "只影响渲染结果，不改变数据流。改坏最多是某个零件变形，不会丢数据。",
+          safety: "safe"
+        }
+      },
+      relatedLabel: "谁在用这块",
+      related: ["pages/Home.jsx", "pages/Add.jsx", "pages/Stats.jsx"],
+      deeper: {
+        search: "什么是组件化，props 是干嘛的",
+        read: "src/components/Button.jsx（30 行，全项目最好懂的零件）",
+        ask: "components 和 pages 的区别是什么？为什么不能把按钮直接写在页面里？"
+      }
+    },
+
+    store: {
+      path: "src/store",
+      title: "记账的规矩",
+      sub: "所有账目数据的保管员",
+      count: 2,
+      depth: {
+        plain: {
+          lead: "所有账目都放在这里，而且这里规定了「一笔账」长什么样：金额、分类、日期、备注。页面不自己存数据，都来这儿拿。",
+          say: "打比方：像记账本的保管员。你说“记一笔”，他负责写进去、按日期排好、再拿出来给你看。",
+          effect: "改这里会同时影响三个页面：列表、统计、新增。这是最容易连锁出错的地方，改之前先说清楚要改什么。",
+          safety: "risky"
+        },
+        structured: {
+          lead: "职责：唯一的数据来源。负责增删改查、按日期排序、按月聚合。",
+          points: [
+            { k: "职责", v: "数据读写 + 聚合计算 + 本地持久化。" },
+            { k: "边界", v: "不做任何界面相关的事，不关心谁在展示。" },
+            { k: "数据流", v: "组件只读；所有写操作都必须经过这里导出的函数。" }
+          ],
+          effect: "它被 3 个页面同时依赖，改动会辐射到全部界面，是影响面最大的一层。",
+          safety: "risky"
+        },
+        code: {
+          lead: "2 个文件，records.js 约 90 行，导出 4 个函数：list / add / remove / monthlyTotal。",
+          points: [
+            { k: "事实", v: "被 3 个页面引用；自身只依赖 utils/date.js，没有循环依赖。" },
+            { k: "事实", v: "数据落在 localStorage 的一个键里，没有后端也能跑。" },
+            { k: "判断", v: "改了字段名会同时打断三个页面，是典型的“一处改、三处崩”。" }
+          ],
+          effect: "它被 3 个页面同时依赖，改动会辐射到全部界面，是影响面最大的一层。",
+          safety: "risky"
+        }
+      },
+      relatedLabel: "谁在用这块",
+      related: ["pages/Home.jsx", "pages/Add.jsx", "pages/Stats.jsx"],
+      deeper: {
+        search: "什么是单一数据源（single source of truth）",
+        read: "src/store/records.js（90 行，重点看 add 和 monthlyTotal）",
+        ask: "我想加一个“收入”类型，store 里要改哪几行？会不会影响统计？"
+      }
+    },
+
+    server: {
+      path: "server",
+      title: "存东西的地方",
+      sub: "一个很小的柜台",
+      count: 2,
+      depth: {
+        plain: {
+          lead: "这是一个很小的后端，只做两件事：把账目存进数据库，再读出来。现在数据存在本地文件里，所以换台电脑就没了。",
+          say: "打比方：像银行柜台。页面是顾客，柜台负责存取，柜台后面才是金库。",
+          effect: "改这里不会改变页面长什么样，但接口一旦对不上，整个站点会拿不到数据、显示空白。",
+          safety: "careful"
+        },
+        structured: {
+          lead: "职责：提供 /api/records 的读写接口，连接 SQLite。",
+          points: [
+            { k: "职责", v: "接收请求、读写数据库、返回 JSON。" },
+            { k: "边界", v: "不管界面，也不校验业务规则——那些在 store 里。" },
+            { k: "调用链", v: "页面 → store → fetch → server → 数据库。" }
+          ],
+          effect: "接口形状一旦改变，前端会静默失败（拿到空数组），看起来像是“数据没了”。",
+          safety: "careful"
+        },
+        code: {
+          lead: "2 个文件。index.js 约 140 行，db.js 约 60 行。",
+          points: [
+            { k: "事实", v: "前端只通过 src/store/records.js 里的一个 fetch 调它，只有 1 个调用点。" },
+            { k: "事实", v: "db.js 里定义了 records 表：id / amount / category / date / note。" },
+            { k: "判断", v: "表结构和 store 的字段名是隐式约定，改一边不提醒另一边。" }
+          ],
+          effect: "接口形状一旦改变，前端会静默失败（拿到空数组），看起来像是“数据没了”。",
+          safety: "careful"
+        }
+      },
+      relatedLabel: "它和谁连着",
+      related: ["src/store/records.js（调它）", "server/db.js（数据库）"],
+      deeper: {
+        search: "前后端分离，接口是怎么对接的",
+        read: "server/db.js（60 行，能一眼看懂表结构）",
+        ask: "如果我想把数据从本地文件换成云数据库，要改哪几个地方？"
+      }
+    },
+
+    styles: {
+      path: "src/styles",
+      title: "配色和排版",
+      sub: "全站的样子都定在这",
+      count: 2,
+      depth: {
+        plain: {
+          lead: "整个网站的颜色、字号、间距都定在这。改这里，所有页面一起变。",
+          say: "打比方：像装修用的色卡和尺子，所有房间都照着它刷、照着它量。",
+          effect: "改颜色最安全；改字号可能让某些地方挤在一起，改完记得三页都看一眼。",
+          safety: "safe"
+        },
+        structured: {
+          lead: "职责：全局设计变量 + 少量布局类。",
+          points: [
+            { k: "职责", v: "颜色、字号、圆角、间距的唯一出处。" },
+            { k: "边界", v: "不含任何逻辑，也不该出现具体页面的选择器。" },
+            { k: "影响", v: "被全部页面引用，但没有任何 JS 依赖它，改坏了只是难看。" }
+          ],
+          effect: "视觉问题会在三页同时出现，很容易判断是不是这里的问题。",
+          safety: "safe"
+        },
+        code: {
+          lead: "2 个文件，全是 CSS，没有 JS 引用它们。",
+          points: [
+            { k: "事实", v: "变量集中在一个 :root 块里，页面只引用变量名。" },
+            { k: "事实", v: "没有任何组件 import 这两个文件，它们由 main.jsx 全局引入。" },
+            { k: "判断", v: "改颜色是低风险动作；改字号属于“改完要三页都扫一眼”的中风险动作。" }
+          ],
+          effect: "视觉问题会在三页同时出现，很容易判断是不是这里的问题。",
+          safety: "safe"
+        }
+      },
+      relatedLabel: "它和谁连着",
+      related: ["src/main.jsx（全局引入）", "全部页面"],
+      deeper: {
+        search: "CSS 变量是怎么用的",
+        read: "src/styles/tokens.css（只有几十行变量）",
+        ask: "我想把这个站点改成浅色主题，最少要改哪里？"
+      }
+    },
+
+    public: {
+      path: "public",
+      title: "图片和图标",
+      sub: "原样发给浏览器的文件",
+      count: 5,
+      depth: {
+        plain: {
+          lead: "放图片、图标、浏览器标签上的小图标。这里的东西不参与打包，原样发给浏览器。",
+          say: "打比方：像门口的招贴画，贴上去就完事，不用改造房子。",
+          effect: "换图很安全；删掉正在被引用的图，页面上会出现一个破图标。",
+          safety: "safe"
+        },
+        structured: {
+          lead: "职责：静态资源目录，按原路径对外提供。",
+          points: [
+            { k: "职责", v: "图片、favicon、字体等不需要编译的文件。" },
+            { k: "边界", v: "不参与构建，路径写错不会报错，只会静默 404。" },
+            { k: "影响", v: "只影响引用到它的那一处。" }
+          ],
+          effect: "换图很安全；删掉正在被引用的图，页面上会出现一个破图标。",
+          safety: "safe"
+        },
+        code: {
+          lead: "5 个文件：1 个 favicon、3 张插图、1 个图标字体。",
+          points: [
+            { k: "事实", v: "logo.png 被 index.html 和 2 个页面引用，是这里被引用最多的文件。" },
+            { k: "事实", v: "没有任何 JS 代码 import 这里的文件，都是字符串路径。" },
+            { k: "判断", v: "删文件不会导致编译失败，只会在页面上留一个破图。" }
+          ],
+          effect: "换图很安全；删掉正在被引用的图，页面上会出现一个破图标。",
+          safety: "safe"
+        }
+      },
+      relatedLabel: "谁在用这块",
+      related: ["index.html", "src/pages/Home.jsx"],
+      deeper: {
+        search: "静态资源和打包资源有什么区别",
+        read: "public 目录本身（看一眼文件名就够了）",
+        ask: "我想换掉浏览器标签上的小图标，改哪个文件？"
+      }
+    }
+  };
+
+  const TREE = [
+    { kind: "home", label: "项目导览" },
+    { kind: "group", label: "源码" },
+    { id: "pages",      label: "pages",      count: 3, lvl: 1 },
+    { id: "components", label: "components", count: 8, lvl: 1 },
+    { id: "store",      label: "store",      count: 2, lvl: 1 },
+    { id: "styles",     label: "styles",     count: 2, lvl: 1 },
+    { kind: "group", label: "" },
+    { id: "server",     label: "server",     count: 2, lvl: 0 },
+    { id: "public",     label: "public",     count: 5, lvl: 0 },
+    { id: "entry",      label: "index.html", count: 1, lvl: 0 }
+  ];
+
+  const DEPTHS = [
+    { id: "plain",      label: "讲给我听" },
+    { id: "structured", label: "讲清结构" },
+    { id: "code",       label: "看到代码" }
+  ];
+
+  const START = { view: "home", depth: "plain" };
+
+  const state = {
+    view: START.view,
+    depth: START.depth,
+    known: new Set(["entry", "pages", "components"]),
+    correcting: false,
+    simplifyHint: false
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  let toastTimer = null;
+  function toast(msg) {
+    const el = $("toast");
+    el.textContent = msg;
+    el.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
+  }
+
+  /* ---------------- tree ---------------- */
+  function renderTree() {
+    $("tree").innerHTML = TREE.map((n) => {
+      if (n.kind === "group") {
+        return n.label ? `<div class="group-label">${esc(n.label)}</div>` : `<div style="height:10px"></div>`;
+      }
+      if (n.kind === "home") {
+        return `<div class="ti ${state.view === "home" ? "on" : ""}" data-view="home">
+          <span class="nm">项目导览</span></div>`;
+      }
+      const on = state.view === n.id ? "on" : "";
+      const known = state.known.has(n.id) ? `<span class="dot" title="已懂"></span>` : "";
+      return `<div class="ti ${on} lvl${n.lvl}" data-view="${n.id}">
+        <span class="nm">${esc(n.label)}</span>${known}
+        <span class="cnt">${n.count}</span></div>`;
+    }).join("");
+  }
+
+  /* ---------------- status bar ---------------- */
+  function renderStatus() {
+    const s = $("status");
+    if (state.view === "home") {
+      s.innerHTML = `<b>${PROJECT.name}</b> · 地图生成于 2 分钟前 · 42 个文件 · 6 个区域`;
+    } else {
+      const c = CARDS[state.view];
+      s.innerHTML = `<b>${c.path}</b> · ${c.count} 个文件 · 上次生成 2 分钟前`;
+    }
+  }
+
+  /* ---------------- overview ---------------- */
+  function renderHome() {
+    const route = PROJECT.route.map((r, i) => `
+      <li>
+        <div class="rnum">${i + 1}</div>
+        <div>
+          <div class="rtitle">看 <span class="rfile">${esc(r.file)}</span></div>
+          <div class="rwhy">${esc(r.why)}</div>
+        </div>
+      </li>`).join("");
+
+    const blocks = PROJECT.blocks.map((b) => `
+      <div class="blk" data-view="${b.id}">
+        <div class="blk-top">
+          <span class="${state.known.has(b.id) ? "dot-ok" : "dot-open"}"></span>
+          <span class="blk-name">${esc(b.name)}</span>
+          <span class="blk-tag">${esc(b.tag)}</span>
+        </div>
+        <div class="blk-line">${esc(b.line)}</div>
+      </div>`).join("");
+
+    const ignore = PROJECT.ignore.map((g) => `
+      <div class="ig-row"><code>${esc(g.name)}</code><span>${esc(g.why)}</span></div>`).join("");
+
+    return `
+      <div class="eyebrow">项目导览</div>
+      <h1>记账本 · 一个能记账的小网页</h1>
+      <div class="lede">刚读了一遍代码。下面是我理解的样子。</div>
+
+      <div class="what">${PROJECT.what.map((p) => `<p>${esc(p)}</p>`).join("")}</div>
+
+      <div class="sec-h"><h2>它由这几块组成</h2><span>点任意一块，看它管什么</span></div>
+      <div class="blocks">${blocks}</div>
+
+      <div class="sec-h"><h2>从哪看起</h2><span>按这个顺序，半小时能看明白大半</span></div>
+      <ol class="route">${route}</ol>
+
+      <div class="sec-h"><h2>这些你不用管</h2><span>属于工具，不属于这个项目</span></div>
+      <details class="ignore"><summary>5 个文件，看了也没用</summary><div class="ig-list">${ignore}</div></details>
+
+      <div class="fineprint">
+        这份导览由 AI 读完你的代码后生成。标了「事实」的内容来自代码本身（谁引用了谁、多少行、改了哪些文件）；
+        其余的人话是 AI 的理解，可能不准，看到不对就点开那一块纠错。
+      </div>`;
+  }
+
+  /* ---------------- folder card ---------------- */
+  function renderCard(id) {
+    const c = CARDS[id];
+    const d = c.depth[state.depth];
+
+    if (state.known.has(id)) {
+      return `
+        <div class="crumb"><b>${esc(c.path)}</b></div>
+        <h1>${esc(c.title)}</h1>
+        <div class="known-box">
+          <span class="dot-ok"></span>
+          <div>这块你标过「懂了」：<b>${esc(c.depth.plain.say.replace("打比方：", "").split("。")[0])}</b></div>
+          <div class="spacer"></div>
+          <button class="foot-btn" data-action="unlearn">再看一遍</button>
+        </div>
+        <div class="card-foot">
+          <button class="foot-btn" data-action="unlearn">我要重新看</button>
+          <button class="foot-btn" data-action="correct">这里其实不对</button>
+        </div>
+        ${correctBox()}`;
+    }
+
+    const segs = DEPTHS.map((x) =>
+      `<button class="${state.depth === x.id ? "on" : ""}" data-depth="${x.id}">${x.label}</button>`
+    ).join("");
+
+    let body;
+    if (state.depth === "plain") {
+      body = `
+        <p class="prose">${esc(d.lead)}</p>
+        <p class="say">${esc(d.say)}</p>
+        ${effectBlock(d)}`;
+    } else {
+      const pts = d.points.map((p) =>
+        `<li><span class="k">${esc(p.k)}</span><span class="v">${esc(p.v)}</span></li>`).join("");
+      body = `
+        <p class="prose">${esc(d.lead)}</p>
+        <ul class="kv" style="margin-top:14px">${pts}</ul>
+        ${effectBlock(d)}`;
+    }
+
+    const chips = c.related.map((r) => `<span class="chip">${esc(r)}</span>`).join("");
+    const readText = c.deeper.read;
+    const cut = readText.indexOf("（");
+    const readFile = cut > 0 ? readText.slice(0, cut) : readText;
+    const readNote = cut > 0 ? readText.slice(cut) : "";
+
+    return `
+      <div class="crumb"><b>${esc(c.path)}</b></div>
+      <h1>${esc(c.title)}</h1>
+      <div class="lede">${esc(c.sub)}</div>
+
+      <div class="segs">${segs}</div>
+      <div class="card">${body}</div>
+
+      <div class="rel">
+        <div class="rel-h">${esc(c.relatedLabel || "跟谁有关系")}</div>
+        <div class="chips">${chips}</div>
+      </div>
+
+      <div class="deeper">
+        <div class="deep-row">
+          <div class="deep-k">想深入</div>
+          <div class="deep-v">去搜：${esc(c.deeper.search)}</div>
+        </div>
+        <div class="deep-row">
+          <div class="deep-k"></div>
+          <div class="deep-v">去读：<code>${esc(readFile)}</code>${esc(readNote)}</div>
+        </div>
+        <div class="deep-row">
+          <div class="deep-k">问 AI</div>
+          <div class="deep-v">"${esc(c.deeper.ask)}"<span class="ask">点一下就能直接发出去。</span></div>
+        </div>
+      </div>
+
+      <div class="card-foot">
+        <button class="foot-btn" data-action="learn">✓ 这块我懂了</button>
+        <button class="foot-btn" data-action="simplify">再讲简单点</button>
+        <button class="foot-btn" data-action="correct">这里讲错了</button>
+      </div>
+      ${correctBox()}`;
+  }
+
+  function effectBlock(d) {
+    const label = { safe: "放心改", careful: "要小心", risky: "别乱碰" }[d.safety];
+    const head = state.depth === "plain" ? "改了会怎样" : "影响面";
+    return `
+      <div class="effect">
+        <div class="effect-h"><span class="pill ${d.safety}">${label}</span><span>${head}</span></div>
+        <p>${esc(d.effect)}</p>
+      </div>`;
+  }
+
+  function correctBox() {
+    return `
+      <div class="correct ${state.correcting ? "open" : ""}">
+        <textarea placeholder="哪儿不对？比如：这个文件夹其实是放样式的，不是放数据的。">${
+          state.correcting && state.draft ? esc(state.draft) : ""
+        }</textarea>
+        <div class="correct-bar">
+          <button class="foot-btn" data-action="send-correct">提交</button>
+          <span class="correct-note">记在本地，下次重新生成时会带上你的更正。</span>
+        </div>
+      </div>`;
+  }
+
+  /* ---------------- render ---------------- */
+  function render() {
+    renderTree();
+    renderStatus();
+    $("view").innerHTML = state.view === "home" ? renderHome() : renderCard(state.view);
+    $("view").scrollTop = 0;
+    document.querySelector(".main").scrollTop = 0;
+  }
+
+  /* ---------------- events ---------------- */
+  document.addEventListener("click", (e) => {
+    const viewEl = e.target.closest("[data-view]");
+    if (viewEl) {
+      const id = viewEl.getAttribute("data-view");
+      if (id !== state.view) {
+        state.view = id;
+        state.correcting = false;
+        state.simplifyHint = false;
+        try { history.replaceState(null, "", id === "home" ? "#" : "#" + id); } catch (err) {}
+        render();
+      }
+      return;
+    }
+
+    const depthEl = e.target.closest("[data-depth]");
+    if (depthEl) {
+      state.depth = depthEl.getAttribute("data-depth");
+      render();
+      return;
+    }
+
+    const actEl = e.target.closest("[data-action]");
+    if (!actEl) return;
+    const act = actEl.getAttribute("data-action");
+
+    if (act === "refresh") {
+      toast("已经是最新的了。代码结构有变化时会自动提醒你。");
+      return;
+    }
+    if (act === "learn") {
+      state.known.add(state.view);
+      toast("记下了。这块以后只留一句提醒，不再占你注意力。");
+      render();
+      return;
+    }
+    if (act === "unlearn") {
+      state.known.delete(state.view);
+      render();
+      return;
+    }
+    if (act === "correct") {
+      state.correcting = !state.correcting;
+      render();
+      const ta = document.querySelector(".correct textarea");
+      if (ta) ta.focus();
+      return;
+    }
+    if (act === "simplify") {
+      if (state.depth === "plain") {
+        toast("已经是最简单的一版了。可以直接问我更具体的，比如“这里改了会坏哪”。");
+      } else {
+        state.depth = "plain";
+        toast("换成更好懂的版本了。");
+        render();
+      }
+      return;
+    }
+    if (act === "send-correct") {
+      const ta = document.querySelector(".correct textarea");
+      const v = ta ? ta.value.trim() : "";
+      if (!v) {
+        toast("先写一句哪儿不对。");
+        return;
+      }
+      state.correcting = false;
+      state.draft = "";
+      toast("记下了。下次重新生成导览时会用你的说法。");
+      return;
+    }
+  });
+
+  document.addEventListener("input", (e) => {
+    if (e.target.tagName === "TEXTAREA") state.draft = e.target.value;
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && state.correcting) {
+      state.correcting = false;
+      render();
+    }
+  });
+
+  /* 深链：prototype/index.html#store 直接打开某个文件夹 */
+  try {
+    const hash = decodeURIComponent((location.hash || "").slice(1));
+    if (hash === "home" || Object.prototype.hasOwnProperty.call(CARDS, hash)) state.view = hash;
+    const m = /[?&]depth=(plain|structured|code)/.exec(location.search || "");
+    if (m) state.depth = m[1];
+  } catch (err) { /* file:// 下拿不到也没关系 */ }
+
+  render();
+})();
+</script>
+</body>
+</html>

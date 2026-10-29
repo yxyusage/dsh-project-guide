@@ -1,0 +1,5 @@
+# 一个 bundle 层：这一行加载包的主入口作为 Host 半（普通 Cordis 插件），
+# package.json 里的 dsh.client 让 Web 端把 ./client 作为浏览器半加载。
+- insert:
+    - id: project-guide
+      name: dsh-project-guide
