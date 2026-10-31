@@ -811,6 +811,39 @@ function deeperFor(node) {
   }
 }
 
+/** 词典 + 事实拼出来的精简文案。 */
+function heuristicSummary(node) {
+  const heuristic = heuristicFor(node)
+  return {
+    title: heuristic.title,
+    oneLine: heuristic.oneLine,
+    say: heuristic.plain.lead,
+    effect: heuristic.plain.effect,
+    safety: heuristic.safety,
+    source: heuristic.source,
+  }
+}
+
+/** 根节点说整个项目，而不是「项目里的一块」。 */
+function projectSummary(tree) {
+  const langs = (tree.stats.languages ?? [])
+    .slice(0, 3)
+    .map(([ext, count]) => `${ext}×${count}`)
+    .join('  ')
+  const biggest = (tree.stats.biggest ?? [])
+    .slice(0, 3)
+    .map((item) => `${item.name}（${item.fileCount}）`)
+    .join('、')
+  return {
+    title: tree.name,
+    oneLine: `${tree.stats.dirs} 个文件夹、${tree.stats.files} 个文件`,
+    say: `主要文件类型是 ${langs || '一些散文件'}${biggest === '' ? '' : `；比较大的区域有 ${biggest}`}。左边可以逐层展开。`,
+    effect: '改动的影响取决于你动的是哪一块：点开具体文件夹或文件，这里会说明改了会怎样。',
+    safety: 'careful',
+    source: 'facts',
+  }
+}
+
 /**
  * 点开节点时拿事实。文件夹只读树（零 IO），文件才读内容。
  * 返回直接给浏览器的精简结构，不含模型输出。
@@ -826,15 +859,7 @@ async function nodeFacts(rootAbs, rel, options) {
   const node = findNode(tree.tree, rel)
   if (!node) return { ok: false, error: '树里找不到这个位置' }
 
-  const heuristic = heuristicFor(node)
-  const summary = {
-    title: heuristic.title,
-    oneLine: heuristic.oneLine,
-    say: heuristic.plain.lead,
-    effect: heuristic.plain.effect,
-    safety: heuristic.safety,
-    source: heuristic.source,
-  }
+  const summary = rel === '' ? projectSummary(tree) : heuristicSummary(node)
   const deeper = deeperFor(node)
 
   if (info.isDirectory()) {

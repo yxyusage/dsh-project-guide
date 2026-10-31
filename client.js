@@ -352,6 +352,19 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 .lu-badge.safe{color:var(--lu-ok);border-color:color-mix(in srgb,var(--lu-ok) 40%,transparent)}
 .lu-badge.risky{color:var(--lu-bad);border-color:color-mix(in srgb,var(--lu-bad) 40%,transparent)}
 .lu-badge.careful{color:var(--lu-warn);border-color:color-mix(in srgb,var(--lu-warn) 40%,transparent)}
+.lu-app{--lu-rail-w:240px}
+.lu-rail{width:var(--lu-rail-w);flex:none;min-width:0}
+.lu-splitter{width:5px;flex:none;cursor:col-resize;background:transparent;margin-left:-3px;margin-right:-2px;position:relative;z-index:3;border-radius:3px;outline:none}
+.lu-splitter:hover,.lu-splitter:focus-visible{background:var(--lu-brand)}
+.lu-app.dragging{cursor:col-resize}
+.lu-app.dragging *{user-select:none!important}
+.lu-detail{margin-top:16px;padding:14px 16px;border:1px solid var(--lu-bd);border-radius:10px;background:var(--lu-l1)}
+.lu-detail-h{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap}
+.lu-detail-t{font-weight:600;color:var(--lu-fg);font-size:13.5px}
+.lu-actions-row{display:flex;gap:8px;margin-top:18px;flex-wrap:wrap;align-items:center}
+.lu-note{font-size:12px;color:var(--lu-warn);margin-top:10px}
+.lu-muted{font-size:11.5px;color:var(--lu-idle)}
+@media (max-width:900px){.lu-app{--lu-rail-w:200px}}
 `
 
 		function GuideIcon(props) {
@@ -394,6 +407,10 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 			entries: '入口文件',
 			children: '里面有什么',
 			detailSoon: '更详细的架构说明，下一步接入。',
+			detail: '详细讲',
+			regenerate: '重新生成',
+			cached: '用的是缓存',
+			dragHint: '拖动调整宽度，双击复位',
 			lines: '行数',
 			exportsLabel: '导出的东西',
 			importsLabel: '用到的东西',
@@ -414,6 +431,10 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 			entries: 'Entry files',
 			children: 'What is inside',
 			detailSoon: 'Deeper architecture notes arrive in the next step.',
+			detail: 'Explain in detail',
+			regenerate: 'Regenerate',
+			cached: 'from cache',
+			dragHint: 'Drag to resize, double-click to reset',
 			lines: 'Lines',
 			exportsLabel: 'Exports',
 			importsLabel: 'Uses',
@@ -476,7 +497,78 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 			const [picker, setPicker] = useState(false)
 			const [reload, setReload] = useState(0)
 			const [busy, setBusy] = useState(false)
+			const [detail, setDetail] = useState(null)
+			const [detailStage, setDetailStage] = useState('idle')
+			const [railAria, setRailAria] = useState(240)
 			const factsCache = useRef(new Map())
+			const appRef = useRef(null)
+
+			/** 夹住拖动宽度：最小 180，最大不超过容器 60%，上限 560。 */
+			const clampRail = (width) => {
+				const container = (appRef.current && appRef.current.clientWidth) || window.innerWidth || 900
+				const max = Math.max(240, Math.min(560, Math.round(container * 0.6)))
+				const min = Math.min(180, max)
+				const next = Math.round(Number(width) || 240)
+				return Math.max(min, Math.min(max, next))
+			}
+
+			const setRailWidth = (width, persist) => {
+				const next = clampRail(width)
+				if (appRef.current) appRef.current.style.setProperty('--lu-rail-w', next + 'px')
+				setRailAria(next)
+				if (persist) storageSet('lu.rail', next)
+				return next
+			}
+
+			/* 宽度从本地恢复，并在窗口变化时重新夹一次 */
+			useEffect(() => {
+				setRailWidth(storageGet('lu.rail', 240), false)
+				const onResize = () => {
+					const current = appRef.current
+						? parseFloat(getComputedStyle(appRef.current).getPropertyValue('--lu-rail-w')) || 240
+						: 240
+					setRailWidth(current, false)
+				}
+				window.addEventListener('resize', onResize)
+				return () => window.removeEventListener('resize', onResize)
+			}, [])
+
+			const startDrag = (event) => {
+				const app = appRef.current
+				if (!app) return
+				event.preventDefault()
+				const startX = event.clientX
+				const startW =
+					parseFloat(getComputedStyle(app).getPropertyValue('--lu-rail-w')) || 240
+				app.classList.add('dragging')
+				const move = (moveEvent) => {
+					const next = clampRail(startW + (moveEvent.clientX - startX))
+					app.style.setProperty('--lu-rail-w', next + 'px')
+				}
+				const finish = () => {
+					app.classList.remove('dragging')
+					window.removeEventListener('pointermove', move)
+					window.removeEventListener('pointerup', finish)
+					window.removeEventListener('pointercancel', finish)
+					const current =
+						parseFloat(getComputedStyle(app).getPropertyValue('--lu-rail-w')) || 240
+					setRailWidth(current, true)
+				}
+				window.addEventListener('pointermove', move)
+				window.addEventListener('pointerup', finish)
+				window.addEventListener('pointercancel', finish)
+			}
+
+			const nudgeRail = (event) => {
+				const current = appRef.current
+					? parseFloat(getComputedStyle(appRef.current).getPropertyValue('--lu-rail-w')) || 240
+					: 240
+				if (event.key === 'ArrowLeft') setRailWidth(current - 16, true)
+				else if (event.key === 'ArrowRight') setRailWidth(current + 16, true)
+				else if (event.key === 'Home') setRailWidth(240, true)
+				else return
+				event.preventDefault()
+			}
 
 			/* 首次进入：先问有哪些项目 */
 			useEffect(() => {
@@ -552,6 +644,25 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 					alive = false
 				}
 			}, [selected, stage, projectPath])
+
+			/* 换选中项就清掉上一份「详细」，避免张冠李戴 */
+			useEffect(() => {
+				setDetail(null)
+				setDetailStage('idle')
+			}, [selected, tree])
+
+			const loadDetail = (regen) => {
+				if (detailStage === 'loading' || !projectPath) return
+				setDetailStage('loading')
+				const url =
+					API + '/detail?path=' + encodeURIComponent(projectPath) +
+					'&rel=' + encodeURIComponent(selected) +
+					(regen ? '&regen=1' : '')
+				readJson(url).then((payload) => {
+					setDetail(payload)
+					setDetailStage(payload && payload.ok ? 'ready' : 'error')
+				})
+			}
 
 			const select = (node) => {
 				setSelected(node.path)
@@ -713,6 +824,41 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 				)
 			}
 
+			const detailBlock = () => {
+				const loading = detailStage === 'loading'
+				return h(
+					'div',
+					null,
+					h(
+						'div',
+						{ className: 'lu-actions-row' },
+						h('button', { className: 'lu-btn', onClick: () => loadDetail(false), disabled: loading }, loading ? t('loadingNode') : t('detail')),
+						detail ? h('button', { className: 'lu-btn', onClick: () => loadDetail(true), disabled: loading }, t('regenerate')) : null,
+						detail && detail.ok && detail.cached ? h('span', { className: 'lu-muted' }, t('cached')) : null,
+					),
+					detail && detail.ok === false ? h('p', { className: 'lu-note' }, detail.error || t('error')) : null,
+					detail && detail.ok
+						? h(
+								'div',
+								{ className: 'lu-detail' },
+								h(
+									'div',
+									{ className: 'lu-detail-h' },
+									h('span', { className: 'lu-detail-t' }, detail.detail.title || ''),
+									safetyBadge(detail.detail.safety),
+								),
+								detail.detail.gist ? h('p', { className: 'lu-body' }, detail.detail.gist) : null,
+								detail.detail.does ? h('p', { className: 'lu-body' }, detail.detail.does) : null,
+								detail.detail.takeIn ? h('p', { className: 'lu-muted' }, t('takesIn') + '：' + detail.detail.takeIn) : null,
+								detail.detail.giveOut ? h('p', { className: 'lu-muted' }, t('givesOut') + '：' + detail.detail.giveOut) : null,
+								detail.detail.risk
+									? h('div', { className: 'lu-call' }, h('div', { className: 'lu-call-h' }, t('effect')), h('p', null, detail.detail.risk))
+									: null,
+							)
+						: null,
+				)
+			}
+
 			const pane = () => {
 				if (factsStage === 'loading') {
 					return h('div', { className: 'lu-center' }, h('div', { className: 'lu-spin' }), h('h3', null, t('loadingNode')))
@@ -750,7 +896,7 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 							? h('div', { className: 'lu-sec' }, h('div', { className: 'lu-sec-h' }, h('h2', null, t('commentLabel'))), h('p', { className: 'lu-body' }, facts.comment))
 							: null,
 						facts.kind === 'dir' ? childrenList(facts) : null,
-						h('p', { className: 'lu-why' }, t('detailSoon')),
+						detailBlock(),
 					),
 				)
 			}
@@ -813,9 +959,22 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 
 			return h(
 				'div',
-				{ className: 'lu-app' },
+				{ className: 'lu-app', ref: appRef },
 				h('style', null, CSS),
 				rail,
+				h('div', {
+					className: 'lu-splitter',
+					role: 'separator',
+					'aria-orientation': 'vertical',
+					'aria-valuemin': 180,
+					'aria-valuemax': 560,
+					'aria-valuenow': railAria,
+					tabIndex: 0,
+					title: t('dragHint'),
+					onPointerDown: startDrag,
+					onDoubleClick: () => setRailWidth(240, true),
+					onKeyDown: nudgeRail,
+				}),
 				h('section', { className: 'lu-main' }, stage === 'ready' ? top : null, body),
 				picker
 					? h(
