@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.0-5b8cff?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-0.2.1-5b8cff?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-3fb950?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/DSH-Desktop%20%2B%20Web-6b5cff?style=flat-square">
 </p>
@@ -13,26 +13,48 @@
 # Three things that happen when you build with an AI coding agent
 
 - **You open a blind box.** The agent says "done"; you have no independent way to check, so you roll again.
-- **You can only say "continue".** Not because you don't care, but because describing a problem needs vocabulary — you have "something feels off", it has "the state isn't synced".
+- **You can only say "continue".** Not because you don't care, but because describing a problem needs vocabulary.
 - **You finish a project and learn nothing.** The explanation scrolled away with the conversation.
 
-`dsh-project-guide` adds a **tour layer** to your project: folders in plain words, a clear "safe / careful / hands-off" signal, and cards you can come back to.
+`dsh-project-guide` gives a project a **structure you can read**: an IDE-style tree on the left, an explanation for whatever you click, and a **Detail** button when you want depth.
 
-## What it does
+## What it looks like
 
-**1. Overview** — what this project is, what it is made of, which three files to read first, and which files you never need to open.
+A tree of folders and files — collapsible, root files included — and a detail pane.
 
-**2. Folder card** — one screen: what this part does, what breaks if you change it, who it is connected to. Each card has three depths: `plain talk` / `structure` / `show the code`.
+```
+▾ dsh-project-guide            17
+  ▸ dev                         1
+  ▸ docs                        4
+    client.js
+    index.js                    ← click it; the right side explains it
+    package.json
+    README.md
+```
 
-**3. Down to a file** — the card lists the files inside; open one and it reads only that file: what it does, in what order, what it needs, what it produces, and what breaks when it is wrong.
+- **Collapse**: every folder row has a ▸/▾ on the right; toggling never changes the pane.
+- **Order**: folders first, then names (natural order, Chinese sorted by pinyin).
+- **Search**: matches anywhere in the tree and flattens the result.
+- **Splitter**: drag the divider, double-click to reset; the width is remembered.
 
-## Screenshots
+## How it works
 
-![Overview](docs/overview.png)
+Two separate jobs — only the second costs model tokens:
 
-![A file card](docs/file-card.png)
+| | When | Model usage |
+| --- | --- | --- |
+| Scan structure | once per project, `readdir` only | none — names only, no file contents |
+| Explain | when you press **Detail** | one call; cached by file mtime |
 
-Those folder names tell you what they are — `request relay`, `browser add-on`, `the rules of judgment` — instead of `background.js`, `extension`, `core`.
+So **opening a project is instant and free**. Until you press Detail, the words come from a built-in dictionary (60+ common folder and file names) plus file facts (lines, exports, imports) — that part cannot hallucinate.
+
+Each detail card shows facts and judgment side by side. Risk has four states:
+
+**safe / careful / hands-off / not assessed**
+
+Without positive evidence the answer is "not assessed" — no defaulting to safe. Press **Assess all** to grade a whole level in one model call (a few seconds); those verdicts are marked as *assessed*.
+
+> Upgrading from 0.1? Both the API and the UI changed — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
@@ -40,50 +62,41 @@ Those folder names tell you what they are — `request relay`, `browser add-on`,
 git clone https://github.com/yxyusage/dsh-project-guide.git
 ```
 
-Then install it from that directory in dsh's plugin page (Plugin Manager → Install → pick the folder). A new **Guide** entry appears in the sidebar.
-
-## How it works
-
-Two layers, and facts never mix with opinions:
-
-| Layer | Source | Can it be wrong |
-| --- | --- | --- |
-| Facts | Read from the filesystem: tree, file counts, who imports whom | No |
-| Explanation | A built-in dictionary for common folder names, otherwise your default model | Yes — and it says so |
-
-Deliberate choices:
-
-- **Pay per click.** No whole-repo pre-generation; a file is explained once, on open, then cached by mtime.
-- **Send only what matters.** For a file: the header comment, imported modules, declared names and the first 140 lines — not the whole file.
-- **Survives a bad model.** Truncated JSON is repaired first (close brackets, drop trailing commas), then retried with a smaller prompt, and finally degrades to structure-only with an explicit note.
-
-## Settings
-
-Gear icon:
-
-- **Let the model explain** — off means seconds instead of a wait, but structure only.
-- **How many parts** — 6 / 12 / 18.
-
-Nothing is read at startup; spending is decided by these two switches.
+Then install it from that directory in dsh's plugin page (Plugin Manager → Install → pick the folder). A **Guide** entry appears in the sidebar.
 
 ## Limits
 
-- Import graphs cover JS / TS / JSX / Vue / Svelte / Astro relative imports only.
-- Two levels deep, 26 nodes max — a map with 200 folders is not a map.
-- File explanations are per-file; there is no call-graph yet.
+- Imports cover JS / TS / JSX / Vue / Svelte / Astro relative imports only.
+- **"Imported by" is not implemented** — a reverse index would have to read every code file, which conflicts with instant open. You get "it imports" for the folder you open.
 - 400 KB per file; binaries are reported as unreadable.
+- Tree caps: depth 8, 5000 nodes, 200 files per folder; the UI says when a cap was hit.
+- Hidden files (`.env`, `.git`) and dependency folders (`node_modules`, `dist`) are never listed and never sent to a model.
+- On open, a local import index runs in the background (code files only, no model, capped at 400 files / 1.5 s) to count inbound references; when the cap is hit the index is partial but opening never blocks.
 
 ## Development
 
 ```
-index.js          host half: scan, imports, model call, three read-only APIs
-client.js         browser half: sidebar entry + page (no build step, plain JS)
+index.js          host half: tree scan, facts, model calls, four read-only endpoints
+client.js         browser half: sidebar tree + detail pane (no build step, plain JS)
 cordis.patch.yml  bundle declaration
 locale/           display name and description
 dev/probe.mjs     dev probe: hit the API directly to judge real output
 ```
 
-Changing `index.js` needs a bundle reinstall; `client.js` only needs a page refresh.
+Endpoints under `/api/project-guide/`: `projects` / `tree` / `node` / `detail`.
+
+Applying changes:
+
+- `client.js`: refresh the page;
+- `index.js`: toggle the plugin off and on in Plugin Manager (hot reload, no dsh restart).
+
+Probe usage:
+
+```bash
+node dev/probe.mjs /Users/you/project          # tree + concise copy
+node dev/probe.mjs --detail /Users/you/project src   # also run one Detail
+# add --port 12345 when the web port changed (default 54622)
+```
 
 ## License
 

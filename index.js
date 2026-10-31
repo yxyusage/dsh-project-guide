@@ -1,11 +1,7 @@
-// dsh-project-guide — host half.
+// dsh-project-guide — host half (v2, tree-first).
 //
-// 把用户的项目目录翻译成「人话导览」：
-//   1. 事实层：目录树、文件数、谁引用谁 —— 自己算，不用模型，不会编。
-//   2. 人话层：项目是干什么的、先看哪几个文件、每个文件夹改了会怎样。
-//      常见文件夹名用本地词典（秒出、零成本）；其余交给当前默认模型补一份。
-//
-// 浏览器半通过同源 JSON 路由拿数据，不依赖任何 Remote 生成器。
+// 打开项目只做一件事：把整棵目录树扫出来（只 readdir，不读文件内容、不调模型）。
+// 解释按需生成：点开节点给事实，点「详细」才请模型写人话。
 import { readdir, stat, readFile } from 'node:fs/promises'
 import { join, resolve, extname, sep } from 'node:path'
 
@@ -29,23 +25,42 @@ const SKIP_FILES = new Set([
 ])
 
 const CODE_EXT = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.vue', '.svelte', '.astro'])
-const IGNORE_EXT = new Set(['.lock', '.map', '.ico', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ttf', '.woff', '.woff2'])
 
-/** 根目录里「像入口」的散文件，才值得进结构。 */
+/** 根目录里「像入口」的散文件，用于「从这看起」。 */
 const ENTRY_FILES = /^(index\.(html?|js|ts|jsx|tsx|vue)|main\.(js|mjs|ts|py|go|rs)|app\.(js|ts|py|vue)|server\.(js|ts|mjs)|manage\.py|Makefile|docker-compose\.ya?ml)$/i
 
-/** 递归文件数上限，防止在超大仓库里卡住。 */
-const MAX_WALK = 4000
-/** 进树的节点上限。 */
-const MAX_NODES = 26
+/** 目录树递归深度上限。 */
+const MAX_DEPTH = 8
+/** 树里节点总数上限，防止超大仓库把浏览器撑爆。 */
+const MAX_NODES_TREE = 5000
+/** 单个目录最多列出的文件数，超出部分标记截断。 */
+const MAX_FILES_LIST = 200
+/** 算引用关系时每个目录最多读的代码文件数。 */
+const MAX_REF_FILES = 30
+/** 单文件读取上限。 */
+const MAX_FILE_BYTES = 400 * 1024
+/** 发给模型的代码摘录行数。 */
+const CODE_EXCERPT_LINES = 140
+/** 目录树缓存存活时间；目录 mtime 不随深层变化，所以加个上限。 */
+const TREE_TTL = 30_000
+/** 建引用索引时最多读的文件数。 */
+const MAX_INDEX_FILES = 400
+/** 建引用索引的时间预算，超时就用已读到的部分。 */
+const INDEX_BUDGET_MS = 1500
+/** 一次「评估全部」最多覆盖的节点数。 */
+const MAX_ASSESS = 20
 
-const cache = new Map()
-const inFlight = new Set()
+/** 中文 / 英文混排的稳定排序：文件夹在前，组内自然序。 */
+const collator = new Intl.Collator(['zh-Hans-CN', 'en'], { numeric: true, sensitivity: 'base' })
 
-/* ─────────────────────────── 工具 ─────────────────────────── */
+const treeCache = new Map()
+const detailCache = new Map()
+/** rootAbs → Map(path → { safety, why })；模型「评估全部」的预判结果。 */
+const verdictCache = new Map()
 
 const slash = (p) => p.split(sep).join('/')
 const isCode = (f) => CODE_EXT.has(extname(f).toLowerCase())
+const joinPath = (base, name) => (base === '' ? name : base + '/' + name)
 
 function json(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
@@ -84,41 +99,185 @@ async function listDir(abs) {
   }
 }
 
-/** 递归数文件，并收集顶层可见的扩展名分布。 */
-async function measure(abs, budget) {
-  let count = 0
-  const ext = new Map()
-  const queue = [abs]
-  while (queue.length > 0 && count < budget.limit) {
-    const dir = queue.shift()
-    const entries = await listDir(dir)
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) continue
-        queue.push(join(dir, entry.name))
-        continue
-      }
-      if (!entry.isFile()) continue
-      count += 1
-      const e = extname(entry.name).toLowerCase() || '(无扩展名)'
-      ext.set(e, (ext.get(e) ?? 0) + 1)
-      if (count >= budget.limit) break
-    }
+function makeDirNode(name, path, depth) {
+  return {
+    name,
+    path,
+    kind: 'dir',
+    depth,
+    fileCount: 0,
+    hasCode: false,
+    ext: [],
+    children: [],
+    truncated: false,
   }
-  budget.limit -= count
-  const sorted = [...ext.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
-  let codeCount = 0
-  for (const [name, n] of ext) if (CODE_EXT.has(name)) codeCount += n
-  return { count, ext: sorted, hasCode: codeCount > 0 }
 }
 
-/** 列出直接子文件（用于卡片里的"里面有什么"）。 */
-async function childFiles(abs, limit = 6) {
+/** 文件夹在前，组内按名称。 */
+function byKindThenName(a, b) {
+  if (a.kind !== b.kind) return a.kind === 'dir' ? -1 : 1
+  return collator.compare(a.name, b.name)
+}
+
+function topExt(map, n) {
+  return [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, n)
+}
+
+/**
+ * 一次递归：边列目录边建节点，文件数在回溯时累加。
+ * budget 是全局的，耗尽后只标记 truncated，不再往下展开。
+ */
+async function walkDir(abs, node, budget) {
   const entries = await listDir(abs)
-  return entries
-    .filter((e) => e.isFile() && !SKIP_FILES.has(e.name) && !e.name.startsWith('.'))
-    .slice(0, limit)
-    .map((e) => e.name)
+  const dirNames = []
+  const fileNames = []
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue
+      dirNames.push(entry.name)
+    } else if (entry.isFile()) {
+      if (SKIP_FILES.has(entry.name)) continue
+      fileNames.push(entry.name)
+    }
+  }
+  dirNames.sort(collator.compare)
+  fileNames.sort(collator.compare)
+
+  const ext = new Map()
+  let count = 0
+  let hasCode = false
+  for (const name of fileNames) {
+    const e = extname(name).toLowerCase() || '(无扩展名)'
+    ext.set(e, (ext.get(e) ?? 0) + 1)
+    budget.ext.set(e, (budget.ext.get(e) ?? 0) + 1)
+    if (CODE_EXT.has(e)) hasCode = true
+    count += 1
+  }
+
+  for (const name of dirNames) {
+    if (budget.nodes <= 0) {
+      budget.truncated = true
+      break
+    }
+    const child = makeDirNode(name, joinPath(node.path, name), node.depth + 1)
+    budget.nodes -= 1
+    budget.dirs += 1
+    node.children.push(child)
+    if (child.depth < MAX_DEPTH) {
+      const sub = await walkDir(join(abs, name), child, budget)
+      count += sub.count
+      if (sub.hasCode) hasCode = true
+      for (const [k, v] of sub.ext) ext.set(k, (ext.get(k) ?? 0) + v)
+    } else {
+      child.truncated = true
+    }
+  }
+
+  const shown = fileNames.slice(0, MAX_FILES_LIST)
+  if (shown.length < fileNames.length) node.truncated = true
+  for (const name of shown) {
+    if (budget.nodes <= 0) {
+      budget.truncated = true
+      break
+    }
+    const e = extname(name).toLowerCase()
+    budget.nodes -= 1
+    node.children.push({
+      name,
+      path: joinPath(node.path, name),
+      kind: 'file',
+      depth: node.depth + 1,
+      fileCount: 1,
+      hasCode: CODE_EXT.has(e),
+      ext: [[e || '(无扩展名)', 1]],
+      children: [],
+      truncated: false,
+    })
+  }
+
+  node.children.sort(byKindThenName)
+  node.fileCount = count
+  node.hasCode = hasCode
+  node.ext = topExt(ext, 3)
+  return { count, hasCode, ext }
+}
+
+/**
+ * 扫整棵树。force=true 时忽略缓存（「重新读一遍结构」）。
+ * 返回 { ok, root, name, tree, stats } 或 { ok:false, error }。
+ */
+async function scanTree(rootPath, force) {
+  const rootAbs = resolve(rootPath)
+  const info = await stat(rootAbs).catch(() => null)
+  if (!info || !info.isDirectory()) return { ok: false, error: '这不是一个能打开的文件夹' }
+
+  const hit = treeCache.get(rootAbs)
+  if (!force && hit && Date.now() - hit.at < TREE_TTL) return hit.payload
+
+  const name = info.name || rootAbs.split(sep).filter(Boolean).pop() || 'project'
+  const root = makeDirNode(name, '', 0)
+  const budget = { nodes: MAX_NODES_TREE - 1, dirs: 0, truncated: false, ext: new Map() }
+  await walkDir(rootAbs, root, budget)
+  // 结构建好后顺手把引用索引算出来：只读代码文件，不花模型，用于判风险
+  verdictCache.delete(rootAbs)
+  const index = await buildImportIndex(rootAbs, root)
+
+  const payload = {
+    ok: true,
+    root: slash(rootAbs),
+    name,
+    tree: root,
+    stats: {
+      files: root.fileCount,
+      dirs: budget.dirs,
+      truncated: budget.truncated,
+      index,
+      languages: topExt(budget.ext, 8),
+      entries: root.children
+        .filter((child) => child.kind === 'file' && ENTRY_FILES.test(child.name))
+        .slice(0, 5)
+        .map((child) => child.path),
+      biggest: root.children
+        .filter((child) => child.kind === 'dir')
+        .slice()
+        .sort((a, b) => b.fileCount - a.fileCount)
+        .slice(0, 5)
+        .map((child) => ({ name: child.name, path: child.path, fileCount: child.fileCount })),
+    },
+  }
+  treeCache.set(rootAbs, { at: Date.now(), payload })
+  return payload
+}
+
+/** rel 为空表示根；越界返回 null。用分隔符判断，避免 /proj 命中 /proj-secret。 */
+function insidePath(rootAbs, rel) {
+  const abs = resolve(rootAbs, String(rel ?? ''))
+  if (abs === rootAbs) return abs
+  const base = rootAbs.endsWith(sep) ? rootAbs : rootAbs + sep
+  return abs.startsWith(base) ? abs : null
+}
+
+/** 按路径在树里找节点。 */
+function findNode(root, rel) {
+  if (!rel) return root
+  const parts = String(rel).replace(/\\/g, '/').split('/').filter(Boolean)
+  let node = root
+  for (const part of parts) {
+    const next = node.children.find((child) => child.name === part)
+    if (!next) return null
+    node = next
+  }
+  return node
+}
+
+/** 树里所有目录路径，用于把 import 归到最近的目录。 */
+function collectDirPaths(root, out = []) {
+  if (root.kind === 'dir' && root.path !== '') out.push(root.path)
+  for (const child of root.children) {
+    if (child.kind === 'dir') collectDirPaths(child, out)
+  }
+  return out
 }
 
 /** 读一个目录下的代码文件，抽出内部相对引用（只认 ./ 与 ../）。 */
@@ -131,7 +290,7 @@ async function collectImports(rootAbs, relDir, fileNames) {
       "|^\\s*import\\s*['\"]([^'\"\\n]+)['\"]",
     'gm',
   )
-  const limited = fileNames.filter(isCode).slice(0, 30)
+  const limited = fileNames.filter(isCode).slice(0, MAX_REF_FILES)
   for (const fileName of limited) {
     let text
     try {
@@ -145,7 +304,6 @@ async function collectImports(rootAbs, relDir, fileNames) {
     while ((m = pattern.exec(text)) !== null) {
       const spec = m[1] ?? m[2] ?? m[3] ?? m[4]
       if (!spec || !(spec.startsWith('./') || spec.startsWith('../'))) continue
-      // 归一化成相对项目根的路径，去掉扩展名
       const parts = slash(join(relDir, spec)).split('/')
       const stack = []
       for (const part of parts) {
@@ -171,125 +329,70 @@ function ownerOf(spec, knownDirs) {
   return best
 }
 
-async function scanProject(rootPath) {
-  const rootAbs = resolve(rootPath)
-  const budget = { limit: MAX_WALK }
-  const top = await listDir(rootAbs)
-  const ignored = []
-
-  const topDirs = []
-  const topFiles = []
-  for (const entry of top) {
-    if (entry.isDirectory()) {
-      if (SKIP_DIRS.has(entry.name)) ignored.push(entry.name + '/')
-      else if (!entry.name.startsWith('.')) topDirs.push(entry.name)
-      continue
-    }
-    if (!entry.isFile() || entry.name.startsWith('.')) continue
-    // 根目录的散文件：只有像入口的才进结构，其余归到「你不用管」
-    if (ENTRY_FILES.test(entry.name)) topFiles.push(entry.name)
-    else ignored.push(entry.name)
-  }
-
-  const nodes = []
-  const knownDirs = []
-
-  for (const dirName of topDirs) {
-    const abs = join(rootAbs, dirName)
-    const measured = await measure(abs, budget)
-    const files = await childFiles(abs)
-    const node = {
-      id: dirName,
-      name: dirName,
-      path: dirName,
-      kind: 'dir',
-      depth: 0,
-      fileCount: Math.max(measured.count, files.length),
-      ext: measured.ext,
-      hasCode: measured.hasCode,
-      files,
-      children: [],
-    }
-    nodes.push(node)
-    knownDirs.push(dirName)
-
-    // 只给「装代码的目录」展开一层，避免把 40 个文件夹全铺开
-    const sourceLike = /^(src|app|apps|packages|lib|components|server|api|source|platforms)$/i.test(dirName) || measured.hasCode
-    if (sourceLike && nodes.length < MAX_NODES) {
-      const subEntries = await listDir(abs)
-      const subs = subEntries
-        .filter((e) => e.isDirectory() && !SKIP_DIRS.has(e.name) && !e.name.startsWith('.'))
-        .slice(0, 8)
-      for (const sub of subs) {
-        if (nodes.length >= MAX_NODES) break
-        const subAbs = join(abs, sub.name)
-        const subMeasured = await measure(subAbs, budget)
-        const subFiles = await childFiles(subAbs)
-        const child = {
-          id: `${dirName}/${sub.name}`,
-          name: sub.name,
-          path: `${dirName}/${sub.name}`,
-          kind: 'dir',
-          depth: 1,
-          fileCount: Math.max(subMeasured.count, subFiles.length),
-          ext: subMeasured.ext,
-          hasCode: subMeasured.hasCode,
-          files: subFiles,
-          children: [],
-        }
-        node.children.push(child)
-        nodes.push(child)
-        knownDirs.push(child.id)
-      }
-    }
-  }
-
-  for (const fileName of topFiles.slice(0, 3)) {
-    nodes.push({
-      id: fileName,
-      name: fileName,
-      path: fileName,
-      kind: 'file',
-      depth: 0,
-      fileCount: 1,
-      ext: [[extname(fileName).toLowerCase(), 1]],
-      hasCode: isCode(fileName),
-      files: [fileName],
-      children: [],
-    })
-  }
-
-  // 引用关系：谁用了谁
+/**
+ * 本地引用索引：只读代码文件，不调模型。
+ * 给出「它引用了谁」（imports）和「被谁引用」（importedBy）——后者是判断风险最有力的信号。
+ * 有时间和文件数预算，超了就标记 partial，不阻塞打开项目。
+ */
+async function buildImportIndex(rootAbs, root) {
+  const started = Date.now()
+  const dirs = collectDirPaths(root)
   const edges = new Map()
-  for (const node of nodes) {
-    if (node.kind !== 'dir') continue
-    const imports = await collectImports(rootAbs, node.path, node.files.length > 0 ? node.files : [])
-    const targets = new Set()
-    for (const spec of imports) {
-      const owner = ownerOf(spec, knownDirs)
-      if (owner && owner !== node.id) targets.add(owner)
+  let files = 0
+  let partial = false
+
+  const visit = async (node) => {
+    if (node.kind !== 'dir') return
+    if (Date.now() - started > INDEX_BUDGET_MS) {
+      partial = true
+      return
     }
-    edges.set(node.id, [...targets])
+    const codeFiles = node.children.filter((child) => child.kind === 'file' && child.hasCode).map((child) => child.name)
+    if (codeFiles.length > 0 && files < MAX_INDEX_FILES) {
+      const room = Math.min(MAX_REF_FILES, MAX_INDEX_FILES - files)
+      const limited = codeFiles.slice(0, room)
+      files += limited.length
+      const specs = await collectImports(rootAbs, node.path, limited)
+      const targets = new Set()
+      for (const spec of specs) {
+        const owner = ownerOf(spec, dirs)
+        if (owner && owner !== node.path) targets.add(owner)
+      }
+      if (targets.size > 0) edges.set(node.path, targets)
+    }
+    for (const child of node.children) {
+      if (child.kind === 'dir') await visit(child)
+    }
   }
-  for (const node of nodes) {
-    node.imports = edges.get(node.id) ?? []
-    node.importedBy = nodes.filter((n) => n.id !== node.id && (n.imports ?? []).includes(node.id)).map((n) => n.id)
+  await visit(root)
+
+  const fanIn = new Map()
+  for (const [from, targets] of edges) {
+    for (const to of targets) {
+      if (!fanIn.has(to)) fanIn.set(to, [])
+      fanIn.get(to).push(from)
+    }
   }
 
-  const stats = nodes.reduce(
-    (acc, n) => {
-      acc.files += n.depth === 0 ? n.fileCount : 0
-      return acc
-    },
-    { files: 0 },
-  )
+  const apply = (node) => {
+    node.imports = edges.has(node.path) ? [...edges.get(node.path)] : []
+    node.importedBy = fanIn.get(node.path) ?? []
+    for (const child of node.children) {
+      if (child.kind === 'dir') apply(child)
+    }
+  }
+  apply(root)
 
+  return { files, dirs: dirs.length, partial }
+}
+
+/** 点开一个文件夹时才算引用关系；被谁引用需要全项目索引，本版不做。 */
+/** 引用关系来自打开时建好的索引，不再重复读文件。 */
+async function refsFor(rootAbs, node, tree) {
+  if (node.kind !== 'dir') return { imports: [], importedBy: [] }
   return {
-    root: slash(rootAbs),
-    name: rootAbs.split(sep).filter(Boolean).pop() ?? 'project',
-    nodes,
-    ignored: [...new Set(ignored)].slice(0, 8),
-    stats: { files: stats.files, areas: nodes.filter((n) => n.depth === 0).length },
+    imports: (node.imports ?? []).slice(0, 8),
+    importedBy: (node.importedBy ?? []).slice(0, 8),
   }
 }
 
@@ -549,6 +652,237 @@ const KNOW = {
     effect: '只影响检查结果，不影响产品。',
     safety: 'safe',
   },
+  routes: {
+    title: '地址对照表',
+    oneLine: '哪个网址交给哪段代码',
+    say: '这里列着「用户访问某个网址时，交给谁去处理」的对照关系。',
+    effect: '删掉一条，那个网址就没人接，访问会变成 404。',
+    safety: 'careful',
+  },
+  controllers: {
+    title: '接请求的柜台',
+    oneLine: '每种请求由谁来办',
+    say: '用户的每个动作先到这里，它负责检查要什么，然后叫后面的人干活。',
+    effect: '改错这里，功能会整个不响应，或者返回看不懂的错误。',
+    safety: 'careful',
+  },
+  models: {
+    title: '数据的形状',
+    oneLine: '一条数据长什么样',
+    say: '这里规定「一条数据」有哪些字段、什么类型。存和取都按这个形状来。',
+    effect: '改这里会同时影响存进去和读出来的地方，最容易一处改、多处坏。',
+    safety: 'risky',
+  },
+  services: {
+    title: '业务的做法',
+    oneLine: '一件事具体怎么办',
+    say: '把「怎么办一件事」的步骤集中放在这里，别的地方只负责调用。',
+    effect: '改这里会影响所有调用它的地方，但不会直接改变界面长相。',
+    safety: 'careful',
+  },
+  middleware: {
+    title: '进门前的关卡',
+    oneLine: '请求先过一遍检查',
+    say: '每个请求进来先经过这里，检查身份、记日志、挡掉不合规的。',
+    effect: '改错会影响所有请求：可能全部被拦下，也可能该拦的没拦住。',
+    safety: 'risky',
+  },
+  db: {
+    title: '存东西的地方',
+    oneLine: '真正落地保存数据',
+    say: '负责连接数据库、把数据写进去或者读出来。',
+    effect: '改错了最常见的是「界面没报错，但数据不显示」。',
+    safety: 'risky',
+  },
+  database: {
+    title: '存东西的地方',
+    oneLine: '真正落地保存数据',
+    say: '负责连接数据库、把数据写进去或者读出来。',
+    effect: '改错了最常见的是「界面没报错，但数据不显示」。',
+    safety: 'risky',
+  },
+  migrations: {
+    title: '改表的记录',
+    oneLine: '数据库结构的变更历史',
+    say: '每一次给数据表加字段、改类型，都留一条记录在这里，按顺序执行。',
+    effect: '顺序错了或者和线上不一致，就可能丢数据；这类改动要先备份。',
+    safety: 'risky',
+  },
+  schemas: {
+    title: '数据的规矩',
+    oneLine: '什么数据算合法',
+    say: '定义每个字段的类型和限制，进来出去都要先过这套规矩。',
+    effect: '放宽或收紧都会影响已有数据，老数据可能突然不合法。',
+    safety: 'careful',
+  },
+  handlers: {
+    title: '一件事的处理器',
+    oneLine: '收到通知后做什么',
+    say: '每种事情发生时会走这里，它在里面决定接下来做哪几步。',
+    effect: '改错会让某类事情悄悄不发生，界面上看不出来。',
+    safety: 'careful',
+  },
+  workers: {
+    title: '后台干活的',
+    oneLine: '不占界面的重活',
+    say: '有些活太慢，不能挡着用户，就交给这里的后台进程慢慢做。',
+    effect: '改错不会白屏，而是「点了没反应」或者数据一直不更新。',
+    safety: 'careful',
+  },
+  jobs: {
+    title: '排队要做的事',
+    oneLine: '一件件等着被处理',
+    say: '把要做的事排成队，由后台一件件取出来执行。',
+    effect: '改错可能让任务重复执行，或者排着队永远不动。',
+    safety: 'careful',
+  },
+  queue: {
+    title: '排队的地方',
+    oneLine: '任务先进先出',
+    say: '所有待办任务在这里排队，谁先来谁先被拿走。',
+    effect: '改错会丢任务或卡住整条流水线，属于要小心的一层。',
+    safety: 'risky',
+  },
+  events: {
+    title: '通知站',
+    oneLine: '事情发生后广播给别人',
+    say: '一件事做完后在这里喊一声，关心这件事的模块各自去做自己的部分。',
+    effect: '改错会让某些「顺带做的事」不做了，症状很隐蔽。',
+    safety: 'careful',
+  },
+  i18n: {
+    title: '界面语言对照',
+    oneLine: '同一句话的中英版本',
+    say: '界面上每句话都按名字存在这里，一份中文一份英文，切换语言就是换一份。',
+    effect: '漏一个词，界面上那个位置会显示成代号；改坏符号可能导致整份读不出来。',
+    safety: 'safe',
+  },
+  locales: {
+    title: '界面语言对照',
+    oneLine: '同一句话的中英版本',
+    say: '界面上每句话都按名字存在这里，一份中文一份英文，切换语言就是换一份。',
+    effect: '漏一个词，界面上那个位置会显示成代号；改坏符号可能导致整份读不出来。',
+    safety: 'safe',
+  },
+  templates: {
+    title: '填空的模板',
+    oneLine: '把变量填进固定格式',
+    say: '这里放着固定的版式，真正生成内容时把具体值填进空位。',
+    effect: '改错只会影响生成出来的样子，不会让程序跑不起来。',
+    safety: 'safe',
+  },
+  themes: {
+    title: '换皮肤的地方',
+    oneLine: '颜色和样式的一套套方案',
+    say: '每种主题是一套颜色和间距，换主题就是换这一套值。',
+    effect: '改错只影响长相，不影响功能。',
+    safety: 'safe',
+  },
+  plugins: {
+    title: '外挂',
+    oneLine: '可以插拔的扩展',
+    say: '核心之外的能力放在这里，加载时才接进来，可以按需开关。',
+    effect: '改错可能让某个扩展整体失效，主程序通常还能跑。',
+    safety: 'careful',
+  },
+  sdk: {
+    title: '给外部用的工具包',
+    oneLine: '别人接入你时用的那层',
+    say: '把内部能力包成一套对外的说法，外部只用这一层，不用关心里面怎么实现。',
+    effect: '改了对外说法，用它的外部程序可能跟着坏，属于要小心的接口。',
+    safety: 'careful',
+  },
+  integrations: {
+    title: '跟别人对接',
+    oneLine: '和外部服务打交道的代码',
+    say: '每个外部服务在这里有一份对接代码，负责地址、鉴权和格式转换。',
+    effect: '对方接口一变这里就得改；改错了症状通常是「数据不来」。',
+    safety: 'careful',
+  },
+  cli: {
+    title: '命令行入口',
+    oneLine: '在终端里敲的那条命令',
+    say: '从终端启动程序时先走这里：解析你敲的参数，再叫真正的逻辑。',
+    effect: '改错会让命令报错或者参数不认，但不影响别的方式启动。',
+    safety: 'careful',
+  },
+  infra: {
+    title: '上线的地基',
+    oneLine: '服务器和环境的定义',
+    say: '用代码描述线上要几台机器、什么配置、怎么连起来。',
+    effect: '改错可能让整套环境起不来；这类改动通常要走审批和演练。',
+    safety: 'risky',
+  },
+  deploy: {
+    title: '上线的步骤',
+    oneLine: '把新版本放上去的流程',
+    say: '把「怎么发布」写成步骤：打包、上传、重启、检查。',
+    effect: '改错可能导致发布中断或旧版本被覆盖，动手前先确认。',
+    safety: 'risky',
+  },
+  docker: {
+    title: '装进盒子的配方',
+    oneLine: '把项目打包成可搬运的容器',
+    say: '定义这个项目运行需要什么环境，打成一致的盒子，到哪里都一样跑。',
+    effect: '改错容器起不来，本地开发一般不受影响。',
+    safety: 'careful',
+  },
+  k8s: {
+    title: '集群调度',
+    oneLine: '一堆机器上怎么分配服务',
+    say: '告诉集群要跑几个副本、怎么扩缩容、挂了怎么重启。',
+    effect: '改错可能让服务起不来或流量分错，属于高风险改动。',
+    safety: 'risky',
+  },
+  ci: {
+    title: '自动检查',
+    oneLine: '每次提交后自动跑一遍',
+    say: '提交代码后自动装依赖、跑测试、做检查，不合格就拦下。',
+    effect: '改错可能让检查永远不通过，或者该拦的没拦住。',
+    safety: 'safe',
+  },
+  examples: {
+    title: '示例',
+    oneLine: '给人照着抄的用法',
+    say: '每个例子演示一种用法，通常可以独立运行。',
+    effect: '不参与主流程，改了不影响程序。',
+    safety: 'safe',
+  },
+  fixtures: {
+    title: '测试用的假数据',
+    oneLine: '测试里替代真实数据',
+    say: '测试时不碰真实数据，用这里准备好的固定样本，结果才可重复。',
+    effect: '改了可能让测试对不上而失败；不影响线上。',
+    safety: 'safe',
+  },
+  mocks: {
+    title: '替身',
+    oneLine: '测试里假装的外部服务',
+    say: '测试时不去真调外部服务，用这里的替身返回固定结果。',
+    effect: '替身和真实行为不一致时，测试会「假通过」。',
+    safety: 'safe',
+  },
+  e2e: {
+    title: '端到端测试',
+    oneLine: '像真人一样点一遍',
+    say: '用程序模拟真人操作，从打开界面一直点到结果出现。',
+    effect: '改错会误报或漏报，通常不影响线上功能。',
+    safety: 'safe',
+  },
+  stories: {
+    title: '组件展示页',
+    oneLine: '把零件一个个摆出来看',
+    say: '每个界面零件在这里单独展示，方便调样式、看各种状态。',
+    effect: '不参与正式运行，改了不影响产品。',
+    safety: 'safe',
+  },
+  dashboard: {
+    title: '看板',
+    oneLine: '一屏看完关键指标',
+    say: '把重要数字和图表集中摆在一屏，供人快速判断现状。',
+    effect: '改错通常只是显示不对，不动底层数据。',
+    safety: 'careful',
+  },
 }
 
 /** 根目录常见文件，单独给一句人话，避免「这是项目里的一个文件」这种废话。 */
@@ -560,6 +894,104 @@ const FILE_KNOW = {
   'contributing.md': { title: '怎么参与', oneLine: '给协作者看的开发规范', say: '告诉别人怎么提问题、怎么提交代码。不参与运行。', effect: '改了不影响程序。', safety: 'safe' },
   'index.html': { title: '网页的入口', oneLine: '浏览器打开就开始跑', say: '整个网站从这里启动，它把真正的程序加载进来。通常很短，基本不用改。', effect: '改错了会整页白屏，而且看不出错在哪。', safety: 'risky' },
   'dockerfile': { title: '打包成容器的配方', oneLine: '怎么把项目装进一个盒子', say: '一份说明书，告诉工具如何把项目打包成可以到处运行的容器。', effect: '改错了容器起不来；不影响本地开发。', safety: 'careful' },
+  'tsconfig.json': {
+    title: '编译设置',
+    oneLine: '代码怎么翻译成能跑的形式',
+    say: '规定代码的版本、严格程度、哪些文件参与编译。',
+    effect: '改严了会冒出一堆报错，改松了错误会漏到运行时。',
+    safety: 'careful',
+  },
+  'jsconfig.json': {
+    title: '编辑器设置',
+    oneLine: '让编辑器更懂这个项目',
+    say: '告诉编辑器去哪找代码、怎么理解路径别名。',
+    effect: '只影响编辑体验，不影响运行。',
+    safety: 'safe',
+  },
+  'vite.config.ts': {
+    title: '打包设置',
+    oneLine: '开发服务器和打包怎么跑',
+    say: '规定开发时怎么起服务、打包时怎么合并压缩、有哪些快捷路径。',
+    effect: '改错会让开发服务器起不来或打包失败。',
+    safety: 'careful',
+  },
+  'vite.config.js': {
+    title: '打包设置',
+    oneLine: '开发服务器和打包怎么跑',
+    say: '规定开发时怎么起服务、打包时怎么合并压缩、有哪些快捷路径。',
+    effect: '改错会让开发服务器起不来或打包失败。',
+    safety: 'careful',
+  },
+  'webpack.config.js': {
+    title: '打包设置',
+    oneLine: '把很多文件合成几个',
+    say: '规定从哪个文件开始、怎么合并、怎么处理各种类型的文件。',
+    effect: '改错会让打包失败，页面直接白屏。',
+    safety: 'careful',
+  },
+  'jest.config.js': {
+    title: '测试设置',
+    oneLine: '测试怎么跑、跑哪些',
+    say: '规定测试文件在哪、用什么环境跑、覆盖率怎么算。',
+    effect: '改错会导致测试一个都跑不起来，或漏跑一大片。',
+    safety: 'safe',
+  },
+  'vitest.config.ts': {
+    title: '测试设置',
+    oneLine: '测试怎么跑、跑哪些',
+    say: '规定测试文件在哪、用什么环境跑、覆盖率怎么算。',
+    effect: '改错会导致测试一个都跑不起来，或漏跑一大片。',
+    safety: 'safe',
+  },
+  'tailwind.config.js': {
+    title: '样式设置',
+    oneLine: '有哪些颜色和间距可用',
+    say: '定义可用的颜色、字号、间距，样式里只能用这里出现过的值。',
+    effect: '删掉一个值，用到它的地方会突然没样式。',
+    safety: 'safe',
+  },
+  'postcss.config.js': {
+    title: '样式处理',
+    oneLine: '样式文件先怎么加工',
+    say: '规定样式在交给浏览器之前要经过哪些加工步骤。',
+    effect: '改错会让样式整体失效，页面变成没有排版的纯文字。',
+    safety: 'careful',
+  },
+  'docker-compose.yml': {
+    title: '几个盒子的组合',
+    oneLine: '一次启动整套服务',
+    say: '把数据库、后端、前端这些盒子写成一份清单，一条命令全部起来。',
+    effect: '改错可能整套起不来，或者端口撞车。',
+    safety: 'careful',
+  },
+  makefile: {
+    title: '命令快捷方式',
+    oneLine: '把常用命令起个短名字',
+    say: '把一长串命令收成一个短名字，敲一下就跑完。',
+    effect: '改错会让对应命令失效，不影响程序本身。',
+    safety: 'careful',
+  },
+  'requirements.txt': {
+    title: '依赖清单',
+    oneLine: '要装哪些现成的库',
+    say: '列出这个项目依赖的库和版本，装环境时按这份清单来。',
+    effect: '改错版本会装不上，或者装上了跑不对。',
+    safety: 'careful',
+  },
+  'pyproject.toml': {
+    title: '项目说明与依赖',
+    oneLine: '名字、依赖、构建方式',
+    say: '把项目信息和依赖写在一处，工具按它来安装和打包。',
+    effect: '改错会导致装不上或打包失败。',
+    safety: 'careful',
+  },
+  'manifest.json': {
+    title: '应用说明',
+    oneLine: '叫什么、要什么权限',
+    say: '告诉宿主这个应用的名字、图标、需要哪些权限。',
+    effect: '改错可能导致应用装不上，或缺少权限而功能失效。',
+    safety: 'careful',
+  },
 }
 
 function heuristicFor(node) {
@@ -576,21 +1008,49 @@ function heuristicFor(node) {
     }
   }
   const isCodeish = typeof node.hasCode === 'boolean' ? node.hasCode : ext.some((e) => CODE_EXT.has(e))
+  const fanIn = Array.isArray(node.importedBy) ? node.importedBy.length : 0
+  const riskyName = /(config|conf|env|secret|key|migration|schema|infra|deploy|k8s|docker|auth|billing)/.test(base)
+  const safeName = /(docs?|examples?|samples?|fixtures?|mocks?|stories|assets?|images?|img|icons?|public|static|screenshots?|benchmarks?)/.test(base)
+  const isEntry = ENTRY_FILES.test(node.name)
+  const mainExt = ext[0] ?? ''
+  const configExt = ['.json', '.yml', '.yaml', '.toml', '.ini', '.conf', '.env', '.lock'].includes(mainExt)
+  const docExt = ['.md', '.txt', '.rst', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.pdf', '.ttf', '.woff', '.woff2'].includes(mainExt)
+
+  // 没有正面证据时给「未评估」，不再默认放心改
+  let safety = 'unknown'
+  let lead = node.kind === 'file'
+    ? '这是项目里的一个文件，还看不出它重要不重要。'
+    : `这里装着 ${node.fileCount} 个文件，但看不出它是干什么的。`
+  let effect = '还没评估过这块：点「详细」，或先用顶部的「评估全部」，再决定动不动。'
+
+  if (fanIn >= 3) {
+    safety = 'risky'
+    lead = `有 ${fanIn} 处地方引用它，属于公共部分。`
+    effect = '改这里会同时影响多个调用方，是最容易一处改、多处坏的地方。'
+  } else if (isEntry) {
+    safety = 'careful'
+    lead = '这是启动的地方：程序从这里开始跑。'
+    effect = '改错了整个项目起不来，而且不容易一眼看出问题出在哪。'
+  } else if (riskyName || configExt) {
+    safety = 'careful'
+    lead = '看起来是配置、规矩或跟环境有关的东西。'
+    effect = '改错可能让程序行为变化或者起不来，而且通常不会明显报错。'
+  } else if (safeName || docExt) {
+    safety = 'safe'
+    lead = '这里主要是说明、素材或示例，不参与运行。'
+    effect = '改坏最多是显示或说明不对，不影响程序跑起来。'
+  } else if (isCodeish) {
+    safety = 'careful'
+    lead = fanIn > 0 ? `有 ${fanIn} 处地方引用它。` : '这是代码，改了会影响程序运行。'
+    effect = '它参与运行，改动可能影响功能；具体影响范围还不清楚。'
+  }
+
   return {
     title: node.name,
     oneLine: node.kind === 'file' ? `项目里的一个文件` : `项目里的一块，共 ${node.fileCount} 个文件`,
-    plain: {
-      lead: node.kind === 'file'
-        ? '这是项目里的一个文件。模型还没给出解释，你可以先看它被谁引用。'
-        : `这里装着这个项目的 ${node.fileCount} 个文件。还没人给它写过一句人话解释。`,
-      say: '',
-      effect: isCodeish
-        ? '它参与运行，改动可能影响功能。具体影响范围看下面「跟谁有关系」。'
-        : '这里主要是非代码文件，改了大概率只影响外观或说明。',
-      safety: isCodeish ? 'careful' : 'safe',
-    },
-    safety: isCodeish ? 'careful' : 'safe',
-    source: 'facts',
+    plain: { lead, say: '', effect, safety },
+    safety,
+    source: fanIn > 0 ? 'index' : 'facts',
   }
 }
 
@@ -607,57 +1067,6 @@ const SYSTEM = [
   '5. 不确定就说不确定，不要编造项目名、框架名、第三方服务。',
   '6. 只输出 JSON，不要 Markdown 代码块，不要解释。',
 ].join('\n')
-
-/** 给模型的节点上限：太多会把输出截断。 */
-const PROMPT_NODES = 12
-
-function buildPrompt(scan, compact, limit) {
-  const cap = Math.max(4, Math.min(compact ? 6 : limit || PROMPT_NODES, 26))
-  const top = scan.nodes.filter((node) => node.depth === 0)
-  const kids = scan.nodes.filter((node) => node.depth === 1).sort((a, b) => b.fileCount - a.fileCount)
-  const picked = top.slice(0, limit)
-  for (const kid of kids) {
-    if (picked.length >= limit) break
-    picked.push(kid)
-  }
-  const wanted = new Set(picked.map((node) => node.path))
-  const chosen = scan.nodes.filter((node) => wanted.has(node.path))
-
-  const lines = []
-  lines.push(`项目目录：${scan.root}`)
-  lines.push(`一共约 ${scan.stats.files} 个文件，下面列出其中值得讲的 ${chosen.length} 块。`)
-  lines.push('结构（缩进表示子块）：')
-  for (const node of chosen) {
-    const indent = node.depth === 1 ? '  ' : ''
-    const who = node.importedBy.length > 0 ? `；被 ${node.importedBy.slice(0, 3).join('、')} 使用` : ''
-    const uses = node.imports.length > 0 ? `；引用了 ${node.imports.slice(0, 3).join('、')}` : ''
-    lines.push(`${indent}- ${node.path}${who}${uses}`)
-    if (node.files.length > 0) lines.push(`${indent}  里面：${node.files.slice(0, 6).join('、')}`)
-  }
-
-  return [
-    lines.join('\n'),
-    '',
-    '输出这个 JSON（areas 放最前面，别的内容可以后写）：',
-    '{',
-    '  "areas": [{"path": "上面某一行的路径", "title": "不超过 6 字", "say": "一句人话", "metaphor": "一个比方", "effect": "改了会怎样", "safety": "safe|careful|risky"}],',
-    '  "summary": ["这个项目是干什么的", "现在能做什么", "还没做什么 / 有什么限制"],',
-    '  "firstLook": [{"file": "相对路径", "why": "为什么先看它"}],',
-    '  "ignore": [{"name": "文件名或文件夹名", "why": "为什么不用管"}]',
-    '}',
-    '',
-    '要求：',
-    `- areas 必须覆盖上面列出的每一个路径，一个不漏，顺序照抄，path 要一字不差。`,
-    '- areas 要最先写完，免得后面写太长被截断。',
-    '- title 说角色不说名字（例：「记账的规矩」而不是「store」）。',
-    '- say 不超过 40 字，讲它在系统里干什么。',
-    '- metaphor 是一句生活化的比方；想不出就给空字符串。',
-    '- effect 讲改了之后的后果，尽量说症状（例：「页面会白屏」「数据会丢」）。',
-    '- safety 只有 safe / careful / risky 三种：safe=放心改，careful=要小心，risky=别乱碰。',
-    '- firstLook 的 file 必须是上面出现过的路径或其中某个文件名。',
-    '- 只输出 JSON。',
-  ].join('\n')
-}
 
 /** 模型偶尔会把 JSON 说断（截断、多余逗号）。尽量抢救，救不回来才算失败。 */
 function closeBrackets(text) {
@@ -749,238 +1158,6 @@ async function callModel(ctx, prompt, signal, system) {
   }
 }
 
-/* ───────────────────────── 组装最终地图 ───────────────────────── */
-
-/** 取第一句话并压到一行，用来做副标题。 */
-function firstClause(text, max) {
-  const clean = String(text ?? '').replace(/\s+/g, ' ').trim()
-  if (clean === '') return ''
-  const cut = clean.search(/[。！？；!?;]/)
-  let head = cut > 0 ? clean.slice(0, cut) : clean
-  if (head.length > max) head = head.slice(0, max) + '…'
-  return head
-}
-
-function mergeNarration(scan, narration) {
-  // 模型写路径时常带 ./ 或末尾斜杠，这里统一归一化后再对号
-  const normPath = (value) =>
-    String(value ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '').toLowerCase()
-
-  const areas = new Map()
-  const rawAreas = narration ? narration.areas : null
-  if (Array.isArray(rawAreas)) {
-    for (const area of rawAreas) {
-      if (area && typeof area.path === 'string') areas.set(normPath(area.path), area)
-    }
-  } else if (rawAreas && typeof rawAreas === 'object') {
-    for (const [path, area] of Object.entries(rawAreas)) {
-      if (area && typeof area === 'object') areas.set(normPath(path), area)
-    }
-  }
-  // 兼容旧格式：单独的 safety 映射
-  const safety = narration && typeof narration.safety === 'object' && narration.safety ? narration.safety : {}
-
-  for (const node of scan.nodes) {
-    const heuristic = heuristicFor(node)
-    const area = areas.get(normPath(node.path))
-    const safetyTag = area?.safety ?? safety[node.path]
-    const modelSay = typeof area?.say === 'string' && area.say.trim() !== '' ? area.say.trim() : ''
-    const modelMetaphor = typeof area?.metaphor === 'string' && area.metaphor.trim() !== '' ? area.metaphor.trim() : ''
-    node.title = typeof area?.title === 'string' && area.title.trim() !== '' ? area.title.trim() : heuristic.title
-    // 常见文件夹名用词典里那句短的；模型补的块用模型自己那句，截到一句话
-    node.oneLine = heuristic.source === 'heuristic' ? heuristic.oneLine : firstClause(modelSay, 26) || heuristic.oneLine
-    node.plain = {
-      lead: modelSay || heuristic.plain.lead,
-      say: modelMetaphor ? '打比方：' + modelMetaphor : heuristic.plain.say,
-      effect: typeof area?.effect === 'string' && area.effect.trim() !== '' ? area.effect.trim() : heuristic.plain.effect,
-      safety: safetyTag === 'safe' || safetyTag === 'careful' || safetyTag === 'risky' ? safetyTag : heuristic.safety,
-    }
-    node.safety = node.plain.safety
-    node.related = [...(node.importedBy ?? []), ...(node.imports ?? [])].slice(0, 6)
-    node.deeper = deeperFor(node)
-  }
-
-  return {
-    root: scan.root,
-    name: scan.name,
-    generatedAt: Date.now(),
-    stats: scan.stats,
-    nodes: scan.nodes.filter((node) => node.depth === 0),
-    ignored: scan.ignored,
-    summary: narration && Array.isArray(narration.summary) && narration.summary.length > 0
-      ? narration.summary.slice(0, 3).map((s) => String(s).trim()).filter(Boolean)
-      : fallbackSummary(scan),
-    route: narration && Array.isArray(narration.firstLook) && narration.firstLook.length > 0
-      ? narration.firstLook
-          .filter((r) => r && typeof r.file === 'string')
-          .slice(0, 3)
-          .map((r) => ({ file: r.file, why: String(r.why ?? '').trim() || '先看它怎么跑起来的。' }))
-      : fallbackRoute(scan),
-    ignore: narration && Array.isArray(narration.ignore) && narration.ignore.length > 0
-      ? narration.ignore
-          .filter((r) => r && typeof r.name === 'string')
-          .slice(0, 5)
-          .map((r) => ({ name: r.name, why: String(r.why ?? '').trim() }))
-      : scan.ignored.slice(0, 5).map((n) => ({ name: n, why: '给工具看的，不是给你看的。' })),
-    narrated: Boolean(narration),
-  }
-}
-
-function deeperFor(node) {
-  const read = (node.files ?? []).find((f) => isCode(f)) ?? (node.files ?? [])[0] ?? node.name
-  return {
-    search: `「${node.title}」在项目里一般负责什么`,
-    read: node.kind === 'file' ? node.path : `${node.path}/${read}`,
-    ask: `「${node.path}」这块改之前我应该注意什么？`,
-  }
-}
-
-function fallbackSummary(scan) {
-  const top = scan.nodes.filter((n) => n.depth === 0 && n.kind === 'dir').slice(0, 3).map((n) => n.name)
-  return [
-    `这是一个叫 ${scan.name} 的项目，下面有 ${scan.stats.areas} 块、约 ${scan.stats.files} 个文件。`,
-    top.length > 0 ? `主要的部分是：${top.join('、')}。` : '暂时只读到了很少的文件。',
-    '模型还没给出完整解释，下面的内容是从目录和引用关系里直接读出来的。',
-  ]
-}
-
-function fallbackRoute(scan) {
-  const picks = []
-  for (const node of scan.nodes) {
-    const files = node.files ?? []
-    const entry = files.find((f) => ENTRY_FILES.test(f))
-    if (!entry) continue
-    picks.push({
-      file: node.kind === 'file' ? node.path : `${node.path}/${entry}`,
-      why: '这是启动的地方：程序从这里开始跑，顺着它能找到后面的一切。',
-    })
-    if (picks.length >= 3) break
-  }
-  if (picks.length === 0) {
-    for (const node of scan.nodes) {
-      const file = (node.files ?? []).find(isCode)
-      if (!file) continue
-      picks.push({
-        file: node.kind === 'file' ? node.path : `${node.path}/${file}`,
-        why: `这里有 ${node.fileCount} 个文件，先挑一个短的看，比从头读整个项目省力。`,
-      })
-      if (picks.length >= 3) break
-    }
-  }
-  return picks
-}
-
-/* ───────────────────────── 生成流程 ───────────────────────── */
-
-async function run(entry, ctx) {
-  try {
-    entry.phase = '读目录'
-    const scan = await scanProject(entry.path)
-
-    entry.phase = '看引用关系'
-    let narration = null
-    let note = null
-
-    if (entry.useModel) {
-      entry.phase = '写人话'
-      // 第一次给完整结构；如果模型把 JSON 说断了，就退成只讲顶层再试一次
-      for (const compact of [false, true]) {
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), 90000)
-        try {
-          const result = await callModel(ctx, buildPrompt(scan, compact, entry.limit), controller.signal)
-          if (result.error) {
-            note = result.error
-            if (result.retryable === false) break
-            continue
-          }
-          narration = parseJsonLoose(result.text)
-          if (narration !== null) {
-            note = null
-            break
-          }
-          note = '模型这次没把 JSON 说完整，只恢复了能救回来的部分'
-        } finally {
-          clearTimeout(timer)
-        }
-      }
-    } else {
-      note = '这次没有用模型，只读结构'
-    }
-
-    entry.map = mergeNarration(scan, narration)
-    entry.note = note
-    entry.status = 'ready'
-    entry.phase = 'done'
-    entry.finishedAt = Date.now()
-  } catch (error) {
-    entry.status = 'error'
-    entry.error = error instanceof Error ? error.message : String(error)
-    entry.phase = 'error'
-  } finally {
-    inFlight.delete(entry.cacheKey)
-  }
-}
-
-function ensure(ctx, path, options) {
-  const useModel = options?.useModel !== false
-  const limit = Math.max(4, Math.min(Number(options?.limit) || PROMPT_NODES, 26))
-  const key = `${resolve(path)}|${useModel ? 'm' : 'fact'}|${limit}`
-  const existing = cache.get(key)
-  if (existing && existing.status === 'scanning') return existing
-  if (existing && existing.status === 'ready' && !options?.force) return existing
-  const entry = {
-    status: 'scanning',
-    phase: '排队',
-    startedAt: Date.now(),
-    map: null,
-    error: null,
-    note: null,
-    useModel,
-    limit,
-    path: resolve(path),
-    cacheKey: key,
-  }
-  cache.set(key, entry)
-  inFlight.add(key)
-  void run(entry, ctx)
-  return entry
-}
-
-/* ───────────────────────── 路由 ───────────────────────── */
-
-function projectList(ctx) {
-  const registry = ctx.get('workspaceRegistry')
-  const projects = []
-  try {
-    for (const workspace of registry?.list?.() ?? []) {
-      const path = workspace?.path ?? workspace?.directory ?? workspace?.root
-      if (typeof path === 'string' && path.length > 0) {
-        projects.push({ id: String(workspace.id ?? path), title: String(workspace.title ?? workspace.name ?? path), path })
-      }
-    }
-  } catch {
-    /* 注册表不可用就退回默认目录 */
-  }
-
-  let defaultPath = projects.length > 0 ? projects[0].path : null
-  if (!defaultPath) {
-    try {
-      defaultPath = ctx.get('workingDirectory')?.defaultDirectory ?? null
-    } catch {
-      defaultPath = null
-    }
-  }
-  if (!defaultPath) {
-    try {
-      defaultPath = process.cwd()
-    } catch {
-      defaultPath = null
-    }
-  }
-  return { projects, defaultPath, cached: [...cache.keys()] }
-}
-
 /* ───────────────────── 代码层：单个文件 ───────────────────── */
 
 const FILE_SYSTEM = [
@@ -992,10 +1169,6 @@ const FILE_SYSTEM = [
   '4. 不确定就说不确定，不要编造它没做过的事。',
   '5. 只输出 JSON。',
 ].join('\n')
-
-const MAX_FILE_BYTES = 400 * 1024
-const CODE_EXCERPT_LINES = 140
-const fileCache = new Map()
 
 /** 从源码里抽事实：行数、开头注释、依赖、导出的名字。 */
 function analyzeSource(text) {
@@ -1049,69 +1222,351 @@ function buildFilePrompt(rel, info) {
   return bits.join('\n')
 }
 
-async function explainFile(ctx, rootPath, rel, useModel) {
-  const rootAbs = resolve(rootPath)
-  const abs = resolve(rootAbs, rel)
-  if (!abs.toLowerCase().startsWith(rootAbs.toLowerCase())) return { ok: false, error: '路径越界，拒绝读取' }
 
+/* ───────────────────────── 事实与精简文案 ───────────────────────── */
+
+/** 「去哪里接着看」的三条线索。 */
+function deeperFor(node) {
+  const read = (node.children ?? []).find((child) => child.kind === 'file' && isCode(child.name))
+  return {
+    search: `「${node.name}」在项目里一般负责什么`,
+    read: node.path === '' ? node.name : node.path,
+    ask: `「${node.path || node.name}」这块改之前我应该注意什么？`,
+    file: read ? read.path : null,
+  }
+}
+
+/** 词典 + 事实拼出来的精简文案。 */
+function heuristicSummary(node) {
+  const heuristic = heuristicFor(node)
+  return {
+    title: heuristic.title,
+    oneLine: heuristic.oneLine,
+    say: heuristic.plain.lead,
+    effect: heuristic.plain.effect,
+    safety: heuristic.safety,
+    source: heuristic.source,
+  }
+}
+
+/** 根节点说整个项目，而不是「项目里的一块」。 */
+function projectSummary(tree) {
+  const langs = (tree.stats.languages ?? [])
+    .slice(0, 3)
+    .map(([ext, count]) => `${ext}×${count}`)
+    .join('  ')
+  const biggest = (tree.stats.biggest ?? [])
+    .slice(0, 3)
+    .map((item) => `${item.name}（${item.fileCount}）`)
+    .join('、')
+  return {
+    title: tree.name,
+    oneLine: `${tree.stats.dirs} 个文件夹、${tree.stats.files} 个文件`,
+    say: `主要文件类型是 ${langs || '一些散文件'}${biggest === '' ? '' : `；比较大的区域有 ${biggest}`}。左边可以逐层展开。`,
+    effect: '改动的影响取决于你动的是哪一块：点开具体文件夹或文件，这里会说明改了会怎样。',
+    safety: 'careful',
+    source: 'facts',
+  }
+}
+
+/**
+ * 点开节点时拿事实。文件夹只读树（零 IO），文件才读内容。
+ * 返回直接给浏览器的精简结构，不含模型输出。
+ */
+async function nodeFacts(rootAbs, rel, options) {
+  const abs = insidePath(rootAbs, rel)
+  if (!abs) return { ok: false, error: '路径越界，拒绝读取' }
   const info = await stat(abs).catch(() => null)
-  if (!info || !info.isFile()) return { ok: false, error: '这个文件不在了' }
+  if (!info) return { ok: false, error: '这个位置不在了' }
 
-  const key = `${abs}|${info.mtimeMs}|${useModel ? 'm' : 'f'}`
-  const cached = fileCache.get(key)
-  if (cached) return cached
+  const tree = await scanTree(rootAbs)
+  if (!tree.ok) return tree
+  const node = findNode(tree.tree, rel)
+  if (!node) return { ok: false, error: '树里找不到这个位置' }
+
+  const summary = rel === '' ? projectSummary(tree) : heuristicSummary(node)
+  if (rel !== '') {
+    const verdicts = verdictCache.get(rootAbs)
+    const verdict = verdicts ? verdicts.get(node.path) : null
+    if (verdict) {
+      summary.safety = verdict.safety
+      summary.why = verdict.why
+      summary.source = 'model'
+    }
+  }
+  const deeper = deeperFor(node)
+
+  if (info.isDirectory()) {
+    const refs = options?.refs ? await refsFor(rootAbs, node, tree.tree) : null
+    return {
+      ok: true,
+      kind: 'dir',
+      path: node.path,
+      name: node.name,
+      fileCount: node.fileCount,
+      hasCode: node.hasCode,
+      ext: node.ext,
+      truncated: Boolean(node.truncated),
+      children: node.children.map((child) => ({
+        name: child.name,
+        path: child.path,
+        kind: child.kind,
+        fileCount: child.fileCount,
+        hasCode: child.hasCode,
+      })),
+      summary,
+      deeper,
+      refs,
+    }
+  }
 
   if (info.size > MAX_FILE_BYTES) return { ok: false, error: '文件太大（超过 400KB），先不读' }
-
   const text = await readFile(abs, 'utf8').catch(() => '')
   if (text === '') return { ok: false, error: '读不出这个文件（可能是图片或二进制）' }
   const facts = analyzeSource(text)
-
-  const base = {
+  const payload = {
     ok: true,
-    rel,
+    kind: 'file',
+    path: node.path,
+    name: node.name,
     lines: facts.lines,
+    bytes: facts.bytes,
+    comment: facts.comment,
     names: facts.names,
     imports: facts.imports,
     exports: facts.exports,
-    excerpt: facts.excerpt.split('\n').slice(0, 40).join('\n'),
-    narrated: false,
-    card: null,
-    note: null,
+    summary,
+    deeper,
+  }
+  if (options?.excerpt) payload.excerpt = facts.excerpt.split('\n').slice(0, 40).join('\n')
+  return payload
+}
+
+/* ───────────────────── 详细解释：点按钮才调模型 ───────────────────── */
+
+const FOLDER_SYSTEM = [
+  '你在给一个完全不懂编程的人解释项目里的一个文件夹。',
+  '规则：',
+  '1. 不出现术语缩写；必须用到的词，后面跟一句解释。',
+  '2. 说这个文件夹在项目里扮演什么角色，不要逐个罗列文件名。',
+  '3. 说「改了会怎样」，而不是只说「负责什么」：读者关心的是敢不敢动。',
+  '4. 打比方要具体、生活化，不要用「就像一个模块」这种同义反复。',
+  '5. 不确定就说不确定，不要编造框架名、服务名。',
+  '6. 只输出 JSON，不要 Markdown 代码块。',
+].join('\n')
+
+function buildFolderPrompt(node, isRoot) {
+  const dirs = node.children.filter((child) => child.kind === 'dir')
+  const files = node.children.filter((child) => child.kind === 'file')
+  const lines = []
+  lines.push(isRoot ? `这是一个项目，名叫 ${node.name}。` : `文件夹：${node.path}`)
+  lines.push(`里面共 ${node.fileCount} 个文件、${dirs.length} 个子文件夹。`)
+  if (dirs.length > 0) lines.push(`子文件夹：${dirs.slice(0, 12).map((child) => child.name).join('、')}`)
+  if (files.length > 0) lines.push(`直接包含的文件：${files.slice(0, 20).map((child) => child.name).join('、')}`)
+  const ext = (node.ext ?? []).map(([name, count]) => `${name}×${count}`).join(' ')
+  if (ext !== '') lines.push(`文件类型：${ext}`)
+  lines.push(
+    '',
+    '输出 JSON：',
+    '{',
+    '  "title": "不超过 8 字，说它的角色",',
+    '  "gist": "一句话：它在整个项目里扮演什么角色",',
+    '  "does": "2~3 句：里面的东西合起来做了什么，按发生顺序说",',
+    '  "risk": "改了它，会看到什么症状",',
+    '  "safety": "safe|careful|risky"',
+    '}',
+    '只输出 JSON。',
+  )
+  return lines.join('\n')
+}
+
+/**
+ * 生成「详细」解释。按文件 mtime / 目录 mtime+规模缓存；
+ * regen=true 时忽略缓存重新问一次。
+ */
+async function detailFor(ctx, rootAbs, rel, options) {
+  const abs = insidePath(rootAbs, rel)
+  if (!abs) return { ok: false, error: '路径越界，拒绝读取' }
+  const info = await stat(abs).catch(() => null)
+  if (!info) return { ok: false, error: '这个位置不在了' }
+
+  const tree = await scanTree(rootAbs)
+  if (!tree.ok) return tree
+  const node = findNode(tree.tree, rel)
+  if (!node) return { ok: false, error: '树里找不到这个位置' }
+
+  const isFile = info.isFile()
+  const sig = isFile ? String(info.mtimeMs) : `${info.mtimeMs}:${node.children.length}:${node.fileCount}`
+  const key = `${abs}|${isFile ? 'f' : 'd'}|${sig}`
+
+  if (!options?.regen) {
+    const hit = detailCache.get(key)
+    if (hit) return { ok: true, kind: isFile ? 'file' : 'dir', detail: hit, cached: true }
   }
 
-  if (!useModel) {
-    const result = { ...base, note: '这次没有用模型' }
-    fileCache.set(key, result)
-    return result
-  }
-
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 60000)
-  try {
-    const call = await callModel(ctx, buildFilePrompt(rel, facts), controller.signal, FILE_SYSTEM)
-    if (call.error) return { ...base, note: call.error }
-    const parsed = parseJsonLoose(call.text)
-    if (!parsed) return { ...base, note: '模型这次没把 JSON 说完整' }
-    const result = {
-      ...base,
-      narrated: true,
-      card: {
-        title: String(parsed.title ?? '').trim() || null,
+  if (isFile) {
+    if (info.size > MAX_FILE_BYTES) return { ok: false, error: '文件太大（超过 400KB），先不读' }
+    const text = await readFile(abs, 'utf8').catch(() => '')
+    if (text === '') return { ok: false, error: '读不出这个文件（可能是图片或二进制）' }
+    const facts = analyzeSource(text)
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 60000)
+    try {
+      const call = await callModel(ctx, buildFilePrompt(node.path, facts), controller.signal, FILE_SYSTEM)
+      if (call.error) return { ok: false, error: call.error }
+      const parsed = parseJsonLoose(call.text)
+      if (!parsed) return { ok: false, error: '模型这次没把 JSON 说完整，再点一次「重新生成」试试' }
+      const detail = {
+        title: String(parsed.title ?? '').trim() || node.name,
         gist: String(parsed.gist ?? '').trim(),
         does: String(parsed.does ?? '').trim(),
         takeIn: String(parsed.takeIn ?? '').trim(),
         giveOut: String(parsed.giveOut ?? '').trim(),
         risk: String(parsed.risk ?? '').trim(),
         safety: ['safe', 'careful', 'risky'].includes(parsed.safety) ? parsed.safety : 'careful',
-      },
+      }
+      detailCache.set(key, detail)
+      return { ok: true, kind: 'file', detail, cached: false }
+    } finally {
+      clearTimeout(timer)
     }
-    fileCache.set(key, result)
-    return result
+  }
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 90000)
+  try {
+    const call = await callModel(ctx, buildFolderPrompt(node, rel === ''), controller.signal, FOLDER_SYSTEM)
+    if (call.error) return { ok: false, error: call.error }
+    const parsed = parseJsonLoose(call.text)
+    if (!parsed) return { ok: false, error: '模型这次没把 JSON 说完整，再点一次「重新生成」试试' }
+    const detail = {
+      title: String(parsed.title ?? '').trim() || node.name,
+      gist: String(parsed.gist ?? '').trim(),
+      does: String(parsed.does ?? '').trim(),
+      risk: String(parsed.risk ?? '').trim(),
+      safety: ['safe', 'careful', 'risky'].includes(parsed.safety) ? parsed.safety : 'careful',
+    }
+    detailCache.set(key, detail)
+    return { ok: true, kind: 'dir', detail, cached: false }
   } finally {
     clearTimeout(timer)
   }
 }
+
+const ASSESS_SYSTEM = [
+  '你在帮一个不懂编程的人判断：项目里某一块「改了会不会出问题」。',
+  '规则：',
+  '1. 只看给出的路径名、类型和规模，不要凭空假设内容。',
+  '2. 拿不准就用 careful，不要为了好听给 safe。',
+  '3. 只输出 JSON，不要 Markdown 代码块，不要解释。',
+].join('\n')
+
+/**
+ * 显式「评估全部」：一次调用给这一层的每个子项一个风险判断。
+ * 结果进 verdictCache，之后点开节点会直接带上这个判断（标为 model 来源）。
+ */
+async function assessFor(ctx, rootAbs, rel, regen) {
+  const abs = insidePath(rootAbs, rel)
+  if (!abs) return { ok: false, error: '路径越界，拒绝读取' }
+  const tree = await scanTree(rootAbs)
+  if (!tree.ok) return tree
+  const node = findNode(tree.tree, rel)
+  if (!node) return { ok: false, error: '树里找不到这个位置' }
+
+  const targets = node.children.slice(0, MAX_ASSESS)
+  if (targets.length === 0) return { ok: true, assessed: [], note: '这一层没有子项' }
+
+  let verdicts = verdictCache.get(rootAbs)
+  if (!verdicts) {
+    verdicts = new Map()
+    verdictCache.set(rootAbs, verdicts)
+  }
+  if (!regen && targets.every((child) => verdicts.has(child.path))) {
+    return {
+      ok: true,
+      assessed: targets.map((child) => ({ path: child.path, ...verdicts.get(child.path) })),
+      cached: true,
+    }
+  }
+
+  const lines = targets.map(
+    (child) => `- ${child.path}${child.kind === 'dir' ? '/' : ''}（${child.fileCount} 个文件${child.hasCode ? '，含代码' : ''}）`,
+  )
+  const prompt = [
+    `项目：${tree.name}`,
+    `下面是它这一层包含的 ${targets.length} 项。请判断每一项「改了会不会把项目搞坏」，只输出 JSON。`,
+    ...lines,
+    '',
+    '输出格式：',
+    '{"items":[{"path":"上面某一行的路径，一字不差","safety":"safe|careful|risky","why":"不超过 20 字"}]}',
+    '规则：每一项都要给一条；path 必须和上面完全一致；拿不准用 careful；只输出 JSON。',
+  ].join('\n')
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 90000)
+  try {
+    const call = await callModel(ctx, prompt, controller.signal, ASSESS_SYSTEM)
+    if (call.error) return { ok: false, error: call.error }
+    const parsed = parseJsonLoose(call.text)
+    const items = Array.isArray(parsed) ? parsed : parsed && Array.isArray(parsed.items) ? parsed.items : []
+    if (items.length === 0) return { ok: false, error: '模型这次没返回可用的判断' }
+
+    const known = new Map(targets.map((child) => [child.path, child]))
+    let counted = 0
+    for (const item of items) {
+      if (!item || typeof item.path !== 'string') continue
+      const path = item.path.replace(/\/+$/, '')
+      if (!known.has(path)) continue
+      const safety = ['safe', 'careful', 'risky'].includes(item.safety) ? item.safety : 'unknown'
+      verdicts.set(path, { safety, why: String(item.why ?? '').trim().slice(0, 40) })
+      counted += 1
+    }
+    return {
+      ok: true,
+      assessed: targets.map((child) => ({ path: child.path, ...(verdicts.get(child.path) ?? {}) })),
+      counted,
+      cached: false,
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/* ───────────────────────── 项目列表 ───────────────────────── */
+
+function projectList(ctx) {
+  const registry = ctx.get('workspaceRegistry')
+  const projects = []
+  try {
+    for (const workspace of registry?.list?.() ?? []) {
+      const path = workspace?.path ?? workspace?.directory ?? workspace?.root
+      if (typeof path === 'string' && path.length > 0) {
+        projects.push({ id: String(workspace.id ?? path), title: String(workspace.title ?? workspace.name ?? path), path })
+      }
+    }
+  } catch {
+    /* 注册表不可用就退回默认目录 */
+  }
+
+  let defaultPath = projects.length > 0 ? projects[0].path : null
+  if (!defaultPath) {
+    try {
+      defaultPath = ctx.get('workingDirectory')?.defaultDirectory ?? null
+    } catch {
+      defaultPath = null
+    }
+  }
+  if (!defaultPath) {
+    try {
+      defaultPath = process.cwd()
+    } catch {
+      defaultPath = null
+    }
+  }
+  return { projects, defaultPath }
+}
+
+/* ───────────────────────── 路由 ───────────────────────── */
 
 export function apply(ctx) {
   const routes = [
@@ -1126,46 +1581,65 @@ export function apply(ctx) {
     },
     {
       kind: 'exact',
-      path: `${API}/map`,
+      path: `${API}/tree`,
       handler: (req, res) => {
         if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
         if (!requireSameOrigin(req, res)) return
         const url = new URL(req.url ?? '/', 'http://localhost')
         const requestPath = url.searchParams.get('path')
         if (!requestPath) return json(res, 400, { ok: false, error: 'missing-path' })
-        void handleMap(ctx, requestPath, false, url.searchParams).then((payload) => json(res, 200, payload)).catch((error) => {
-          json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
-        })
-      },
-    },
-    {
-      kind: 'exact',
-      path: `${API}/file`,
-      handler: (req, res) => {
-        if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-        if (!requireSameOrigin(req, res)) return
-        const url = new URL(req.url ?? '/', 'http://localhost')
-        const root = url.searchParams.get('path')
-        const rel = url.searchParams.get('rel')
-        if (!root || !rel) return json(res, 400, { ok: false, error: 'missing-path' })
-        const useModel = url.searchParams.get('model') !== '0'
-        void explainFile(ctx, root, rel, useModel)
+        const force = url.searchParams.get('refresh') === '1'
+        void scanTree(requestPath, force)
           .then((payload) => json(res, 200, payload))
           .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
       },
     },
     {
       kind: 'exact',
-      path: `${API}/refresh`,
+      path: `${API}/node`,
+      handler: (req, res) => {
+        if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+        if (!requireSameOrigin(req, res)) return
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const root = url.searchParams.get('path')
+        if (!root) return json(res, 400, { ok: false, error: 'missing-path' })
+        const rel = url.searchParams.get('rel') ?? ''
+        const refs = url.searchParams.get('refs') === '1'
+        void nodeFacts(resolve(root), rel, { refs })
+          .then((payload) => json(res, 200, payload))
+          .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
+      },
+    },
+    {
+      kind: 'exact',
+      path: `${API}/detail`,
       handler: (req, res) => {
         if (req.method !== 'GET' && req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
         if (!requireSameOrigin(req, res)) return
         const url = new URL(req.url ?? '/', 'http://localhost')
-        const requestPath = url.searchParams.get('path')
-        if (!requestPath) return json(res, 400, { ok: false, error: 'missing-path' })
-        void handleMap(ctx, requestPath, true, url.searchParams).then((payload) => json(res, 200, payload)).catch((error) => {
-          json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
-        })
+        const root = url.searchParams.get('path')
+        if (!root) return json(res, 400, { ok: false, error: 'missing-path' })
+        const rel = url.searchParams.get('rel') ?? ''
+        const regen = url.searchParams.get('regen') === '1'
+        void detailFor(ctx, resolve(root), rel, { regen })
+          .then((payload) => json(res, 200, payload))
+          .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
+      },
+    },
+    {
+      kind: 'exact',
+      path: `${API}/assess`,
+      handler: (req, res) => {
+        if (req.method !== 'GET' && req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+        if (!requireSameOrigin(req, res)) return
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const root = url.searchParams.get('path')
+        if (!root) return json(res, 400, { ok: false, error: 'missing-path' })
+        const rel = url.searchParams.get('rel') ?? ''
+        const regen = url.searchParams.get('regen') === '1'
+        void assessFor(ctx, resolve(root), rel, regen)
+          .then((payload) => json(res, 200, payload))
+          .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
       },
     },
   ]
@@ -1182,27 +1656,4 @@ export function apply(ctx) {
       for (const dispose of disposers) dispose()
     }
   }, 'project-guide: routes')
-
-  // 不在启动时偷读：要不要花模型的钱由页面上的设置决定，用户点开才读。
-}
-
-async function handleMap(ctx, requestPath, force, params) {
-  const info = await stat(resolve(requestPath)).catch(() => null)
-  if (!info || !info.isDirectory()) {
-    return { ok: false, error: '这不是一个能打开的文件夹' }
-  }
-  const modelParam = params ? params.get('model') : null
-  const limitParam = params ? params.get('limit') : null
-  const entry = ensure(ctx, requestPath, {
-    force,
-    useModel: modelParam === null ? undefined : modelParam !== '0',
-    limit: limitParam === null ? undefined : Number(limitParam),
-  })
-  if (entry.status === 'error') {
-    return { ok: false, error: entry.error }
-  }
-  if (entry.status === 'ready') {
-    return { ok: true, status: 'ready', map: entry.map, note: entry.note }
-  }
-  return { ok: true, status: 'generating', phase: entry.phase, elapsed: Date.now() - entry.startedAt }
 }

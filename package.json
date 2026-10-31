@@ -1,6 +1,6 @@
 {
   "name": "dsh-project-guide",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Project guide for dsh: turns any folder into a plain-language tour — what each part does, what breaks if you change it, and where to look first. Facts come from the code, the words come from your model.",
   "type": "module",
   "license": "MIT",
