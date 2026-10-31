@@ -48,7 +48,11 @@ Two separate jobs — only the second costs model tokens:
 
 So **opening a project is instant and free**. Until you press Detail, the words come from a built-in dictionary (60+ common folder and file names) plus file facts (lines, exports, imports) — that part cannot hallucinate.
 
-Each detail card shows facts and judgment side by side, with a **safe / careful / hands-off** tag.
+Each detail card shows facts and judgment side by side. Risk has four states:
+
+**safe / careful / hands-off / not assessed**
+
+Without positive evidence the answer is "not assessed" — no defaulting to safe. Press **Assess all** to grade a whole level in one model call (a few seconds); those verdicts are marked as *assessed*.
 
 ## Install
 
@@ -65,6 +69,7 @@ Then install it from that directory in dsh's plugin page (Plugin Manager → Ins
 - 400 KB per file; binaries are reported as unreadable.
 - Tree caps: depth 8, 5000 nodes, 200 files per folder; the UI says when a cap was hit.
 - Hidden files (`.env`, `.git`) and dependency folders (`node_modules`, `dist`) are never listed and never sent to a model.
+- On open, a local import index runs in the background (code files only, no model, capped at 400 files / 1.5 s) to count inbound references; when the cap is hit the index is partial but opening never blocks.
 
 ## Development
 

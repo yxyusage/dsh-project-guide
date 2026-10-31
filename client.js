@@ -351,6 +351,7 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 .lu-badge{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--lu-bd2);color:var(--lu-dim);flex:none}
 .lu-badge.safe{color:var(--lu-ok);border-color:color-mix(in srgb,var(--lu-ok) 40%,transparent)}
 .lu-badge.risky{color:var(--lu-bad);border-color:color-mix(in srgb,var(--lu-bad) 40%,transparent)}
+.lu-badge.unknown{color:var(--lu-idle);border-style:dashed}
 .lu-badge.careful{color:var(--lu-warn);border-color:color-mix(in srgb,var(--lu-warn) 40%,transparent)}
 .lu-app{--lu-rail-w:240px}
 .lu-rail{width:var(--lu-rail-w);flex:none;min-width:0}
@@ -399,7 +400,7 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 			foldersLabel: '文件夹',
 			expand: '展开',
 			collapse: '折叠',
-			version: 'v0.2.0',
+			version: 'v0.2.1',
 			loadingNode: '正在读这一块…',
 			truncated: '目录太大，只展开了前面一部分',
 			types: '文件类型',
@@ -408,6 +409,11 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 			children: '里面有什么',
 			detailSoon: '更详细的架构说明，下一步接入。',
 			detail: '详细讲',
+			unknown: '未评估',
+			assessAll: '评估全部',
+			assessing: '评估中…',
+			assessedN: '这一层已评估 ',
+			predicted: '预判',
 			regenerate: '重新生成',
 			cached: '用的是缓存',
 			dragHint: '拖动调整宽度，双击复位',
@@ -423,7 +429,7 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 			foldersLabel: 'Folders',
 			expand: 'Expand',
 			collapse: 'Collapse',
-			version: 'v0.2.0',
+			version: 'v0.2.1',
 			loadingNode: 'Reading this part…',
 			truncated: 'This tree is large; only part of it is expanded',
 			types: 'File types',
@@ -432,6 +438,11 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 			children: 'What is inside',
 			detailSoon: 'Deeper architecture notes arrive in the next step.',
 			detail: 'Explain in detail',
+			unknown: 'Not assessed',
+			assessAll: 'Assess all',
+			assessing: 'Assessing…',
+			assessedN: 'Assessed this level: ',
+			predicted: 'assessed',
 			regenerate: 'Regenerate',
 			cached: 'from cache',
 			dragHint: 'Drag to resize, double-click to reset',
@@ -478,7 +489,7 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 		const depthOf = (path) => (path === '' ? -1 : path.split('/').length - 1)
 
 		const safetyLabel = (safety, t) =>
-			safety === 'safe' ? t('safe') : safety === 'risky' ? t('risky') : t('careful')
+			safety === 'safe' ? t('safe') : safety === 'risky' ? t('risky') : safety === 'unknown' ? t('unknown') : t('careful')
 
 		function GuidePage(props) {
 			const t = typeof props.t === 'function' ? props.t : (key) => zh[key] || key
@@ -497,6 +508,9 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 			const [picker, setPicker] = useState(false)
 			const [reload, setReload] = useState(0)
 			const [busy, setBusy] = useState(false)
+			const [assessing, setAssessing] = useState(false)
+			const [assessNote, setAssessNote] = useState('')
+			const [factsNonce, setFactsNonce] = useState(0)
 			const [detail, setDetail] = useState(null)
 			const [detailStage, setDetailStage] = useState('idle')
 			const [railAria, setRailAria] = useState(240)
@@ -643,7 +657,7 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 				return () => {
 					alive = false
 				}
-			}, [selected, stage, projectPath])
+			}, [selected, stage, projectPath, factsNonce])
 
 			/* 换选中项就清掉上一份「详细」，避免张冠李戴 */
 			useEffect(() => {
@@ -662,6 +676,28 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 					setDetail(payload)
 					setDetailStage(payload && payload.ok ? 'ready' : 'error')
 				})
+			}
+
+			/* 显式「评估全部」：一次调用给这一层每个子项一个风险判断 */
+			const assessAll = () => {
+				if (assessing || !projectPath) return
+				setAssessing(true)
+				setAssessNote('')
+				const url =
+					API + '/assess?path=' + encodeURIComponent(projectPath) +
+					'&rel=' + encodeURIComponent(selected)
+				readJson(url)
+					.then((payload) => {
+						if (!payload.ok) {
+							setAssessNote(payload.error || t('error'))
+							return
+						}
+						const count = typeof payload.counted === 'number' ? payload.counted : (payload.assessed || []).length
+						setAssessNote(t('assessedN') + count)
+						factsCache.current.clear()
+						setFactsNonce((n) => n + 1)
+					})
+					.finally(() => setAssessing(false))
 			}
 
 			const select = (node) => {
@@ -887,7 +923,8 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 						h('div', { className: 'lu-eyebrow' }, isRoot ? t('overview') : facts.kind === 'dir' ? t('foldersLabel') : t('files')),
 						h('h1', { className: 'lu-h1' }, summary.title || facts.name),
 						summary.oneLine ? h('p', { className: 'lu-lede' }, summary.oneLine) : null,
-						h('div', { className: 'lu-row-meta' }, h('code', { className: 'lu-crumb' }, facts.path || (tree ? tree.root : '')), safetyBadge(summary.safety)),
+						h('div', { className: 'lu-row-meta' }, h('code', { className: 'lu-crumb' }, facts.path || (tree ? tree.root : '')), safetyBadge(summary.safety), summary.source === 'model' && summary.why ? h('span', { className: 'lu-muted', title: summary.why }, t('predicted')) : null),
+						assessNote ? h('p', { className: 'lu-why' }, assessNote) : null,
 						summary.say ? h('p', { className: 'lu-body' }, summary.say) : null,
 						summary.effect ? h('div', { className: 'lu-call' }, h('div', { className: 'lu-call-h' }, t('effect')), h('p', null, summary.effect)) : null,
 						isRoot ? statsBlock() : null,
@@ -939,6 +976,7 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 				{ className: 'lu-top' },
 				h('div', { className: 'lu-crumb' }, h('b', null, tree ? tree.name : ''), ' / ', selected === '' ? t('overview') : selected),
 				h('div', { className: 'lu-spacer' }),
+				h('button', { className: 'lu-btn', onClick: assessAll, disabled: assessing }, assessing ? t('assessing') : t('assessAll')),
 				h('button', { className: 'lu-btn', onClick: refresh, disabled: busy }, busy ? t('refreshing') : t('refresh')),
 			)
 

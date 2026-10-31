@@ -43,12 +43,20 @@ const MAX_FILE_BYTES = 400 * 1024
 const CODE_EXCERPT_LINES = 140
 /** 目录树缓存存活时间；目录 mtime 不随深层变化，所以加个上限。 */
 const TREE_TTL = 30_000
+/** 建引用索引时最多读的文件数。 */
+const MAX_INDEX_FILES = 400
+/** 建引用索引的时间预算，超时就用已读到的部分。 */
+const INDEX_BUDGET_MS = 1500
+/** 一次「评估全部」最多覆盖的节点数。 */
+const MAX_ASSESS = 20
 
 /** 中文 / 英文混排的稳定排序：文件夹在前，组内自然序。 */
 const collator = new Intl.Collator(['zh-Hans-CN', 'en'], { numeric: true, sensitivity: 'base' })
 
 const treeCache = new Map()
 const detailCache = new Map()
+/** rootAbs → Map(path → { safety, why })；模型「评估全部」的预判结果。 */
+const verdictCache = new Map()
 
 const slash = (p) => p.split(sep).join('/')
 const isCode = (f) => CODE_EXT.has(extname(f).toLowerCase())
@@ -211,6 +219,9 @@ async function scanTree(rootPath, force) {
   const root = makeDirNode(name, '', 0)
   const budget = { nodes: MAX_NODES_TREE - 1, dirs: 0, truncated: false, ext: new Map() }
   await walkDir(rootAbs, root, budget)
+  // 结构建好后顺手把引用索引算出来：只读代码文件，不花模型，用于判风险
+  verdictCache.delete(rootAbs)
+  const index = await buildImportIndex(rootAbs, root)
 
   const payload = {
     ok: true,
@@ -221,6 +232,7 @@ async function scanTree(rootPath, force) {
       files: root.fileCount,
       dirs: budget.dirs,
       truncated: budget.truncated,
+      index,
       languages: topExt(budget.ext, 8),
       entries: root.children
         .filter((child) => child.kind === 'file' && ENTRY_FILES.test(child.name))
@@ -317,15 +329,71 @@ function ownerOf(spec, knownDirs) {
   return best
 }
 
+/**
+ * 本地引用索引：只读代码文件，不调模型。
+ * 给出「它引用了谁」（imports）和「被谁引用」（importedBy）——后者是判断风险最有力的信号。
+ * 有时间和文件数预算，超了就标记 partial，不阻塞打开项目。
+ */
+async function buildImportIndex(rootAbs, root) {
+  const started = Date.now()
+  const dirs = collectDirPaths(root)
+  const edges = new Map()
+  let files = 0
+  let partial = false
+
+  const visit = async (node) => {
+    if (node.kind !== 'dir') return
+    if (Date.now() - started > INDEX_BUDGET_MS) {
+      partial = true
+      return
+    }
+    const codeFiles = node.children.filter((child) => child.kind === 'file' && child.hasCode).map((child) => child.name)
+    if (codeFiles.length > 0 && files < MAX_INDEX_FILES) {
+      const room = Math.min(MAX_REF_FILES, MAX_INDEX_FILES - files)
+      const limited = codeFiles.slice(0, room)
+      files += limited.length
+      const specs = await collectImports(rootAbs, node.path, limited)
+      const targets = new Set()
+      for (const spec of specs) {
+        const owner = ownerOf(spec, dirs)
+        if (owner && owner !== node.path) targets.add(owner)
+      }
+      if (targets.size > 0) edges.set(node.path, targets)
+    }
+    for (const child of node.children) {
+      if (child.kind === 'dir') await visit(child)
+    }
+  }
+  await visit(root)
+
+  const fanIn = new Map()
+  for (const [from, targets] of edges) {
+    for (const to of targets) {
+      if (!fanIn.has(to)) fanIn.set(to, [])
+      fanIn.get(to).push(from)
+    }
+  }
+
+  const apply = (node) => {
+    node.imports = edges.has(node.path) ? [...edges.get(node.path)] : []
+    node.importedBy = fanIn.get(node.path) ?? []
+    for (const child of node.children) {
+      if (child.kind === 'dir') apply(child)
+    }
+  }
+  apply(root)
+
+  return { files, dirs: dirs.length, partial }
+}
+
 /** 点开一个文件夹时才算引用关系；被谁引用需要全项目索引，本版不做。 */
+/** 引用关系来自打开时建好的索引，不再重复读文件。 */
 async function refsFor(rootAbs, node, tree) {
   if (node.kind !== 'dir') return { imports: [], importedBy: [] }
-  const files = node.children.filter((child) => child.kind === 'file' && child.hasCode).map((child) => child.name)
-  if (files.length === 0) return { imports: [], importedBy: [] }
-  const specs = await collectImports(rootAbs, node.path, files)
-  const dirs = collectDirPaths(tree)
-  const imports = [...new Set([...specs].map((spec) => ownerOf(spec, dirs)).filter((dir) => dir && dir !== node.path))]
-  return { imports: imports.slice(0, 8), importedBy: [] }
+  return {
+    imports: (node.imports ?? []).slice(0, 8),
+    importedBy: (node.importedBy ?? []).slice(0, 8),
+  }
 }
 
 /* ───────────────────── 人话层：本地词典 ─────────────────────
@@ -940,21 +1008,49 @@ function heuristicFor(node) {
     }
   }
   const isCodeish = typeof node.hasCode === 'boolean' ? node.hasCode : ext.some((e) => CODE_EXT.has(e))
+  const fanIn = Array.isArray(node.importedBy) ? node.importedBy.length : 0
+  const riskyName = /(config|conf|env|secret|key|migration|schema|infra|deploy|k8s|docker|auth|billing)/.test(base)
+  const safeName = /(docs?|examples?|samples?|fixtures?|mocks?|stories|assets?|images?|img|icons?|public|static|screenshots?|benchmarks?)/.test(base)
+  const isEntry = ENTRY_FILES.test(node.name)
+  const mainExt = ext[0] ?? ''
+  const configExt = ['.json', '.yml', '.yaml', '.toml', '.ini', '.conf', '.env', '.lock'].includes(mainExt)
+  const docExt = ['.md', '.txt', '.rst', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.pdf', '.ttf', '.woff', '.woff2'].includes(mainExt)
+
+  // 没有正面证据时给「未评估」，不再默认放心改
+  let safety = 'unknown'
+  let lead = node.kind === 'file'
+    ? '这是项目里的一个文件，还看不出它重要不重要。'
+    : `这里装着 ${node.fileCount} 个文件，但看不出它是干什么的。`
+  let effect = '还没评估过这块：点「详细」，或先用顶部的「评估全部」，再决定动不动。'
+
+  if (fanIn >= 3) {
+    safety = 'risky'
+    lead = `有 ${fanIn} 处地方引用它，属于公共部分。`
+    effect = '改这里会同时影响多个调用方，是最容易一处改、多处坏的地方。'
+  } else if (isEntry) {
+    safety = 'careful'
+    lead = '这是启动的地方：程序从这里开始跑。'
+    effect = '改错了整个项目起不来，而且不容易一眼看出问题出在哪。'
+  } else if (riskyName || configExt) {
+    safety = 'careful'
+    lead = '看起来是配置、规矩或跟环境有关的东西。'
+    effect = '改错可能让程序行为变化或者起不来，而且通常不会明显报错。'
+  } else if (safeName || docExt) {
+    safety = 'safe'
+    lead = '这里主要是说明、素材或示例，不参与运行。'
+    effect = '改坏最多是显示或说明不对，不影响程序跑起来。'
+  } else if (isCodeish) {
+    safety = 'careful'
+    lead = fanIn > 0 ? `有 ${fanIn} 处地方引用它。` : '这是代码，改了会影响程序运行。'
+    effect = '它参与运行，改动可能影响功能；具体影响范围还不清楚。'
+  }
+
   return {
     title: node.name,
     oneLine: node.kind === 'file' ? `项目里的一个文件` : `项目里的一块，共 ${node.fileCount} 个文件`,
-    plain: {
-      lead: node.kind === 'file'
-        ? '这是项目里的一个文件。模型还没给出解释，你可以先看它被谁引用。'
-        : `这里装着这个项目的 ${node.fileCount} 个文件。还没人给它写过一句人话解释。`,
-      say: '',
-      effect: isCodeish
-        ? '它参与运行，改动可能影响功能。具体影响范围看下面「跟谁有关系」。'
-        : '这里主要是非代码文件，改了大概率只影响外观或说明。',
-      safety: isCodeish ? 'careful' : 'safe',
-    },
-    safety: isCodeish ? 'careful' : 'safe',
-    source: 'facts',
+    plain: { lead, say: '', effect, safety },
+    safety,
+    source: fanIn > 0 ? 'index' : 'facts',
   }
 }
 
@@ -1189,6 +1285,15 @@ async function nodeFacts(rootAbs, rel, options) {
   if (!node) return { ok: false, error: '树里找不到这个位置' }
 
   const summary = rel === '' ? projectSummary(tree) : heuristicSummary(node)
+  if (rel !== '') {
+    const verdicts = verdictCache.get(rootAbs)
+    const verdict = verdicts ? verdicts.get(node.path) : null
+    if (verdict) {
+      summary.safety = verdict.safety
+      summary.why = verdict.why
+      summary.source = 'model'
+    }
+  }
   const deeper = deeperFor(node)
 
   if (info.isDirectory()) {
@@ -1348,6 +1453,85 @@ async function detailFor(ctx, rootAbs, rel, options) {
   }
 }
 
+const ASSESS_SYSTEM = [
+  '你在帮一个不懂编程的人判断：项目里某一块「改了会不会出问题」。',
+  '规则：',
+  '1. 只看给出的路径名、类型和规模，不要凭空假设内容。',
+  '2. 拿不准就用 careful，不要为了好听给 safe。',
+  '3. 只输出 JSON，不要 Markdown 代码块，不要解释。',
+].join('\n')
+
+/**
+ * 显式「评估全部」：一次调用给这一层的每个子项一个风险判断。
+ * 结果进 verdictCache，之后点开节点会直接带上这个判断（标为 model 来源）。
+ */
+async function assessFor(ctx, rootAbs, rel, regen) {
+  const abs = insidePath(rootAbs, rel)
+  if (!abs) return { ok: false, error: '路径越界，拒绝读取' }
+  const tree = await scanTree(rootAbs)
+  if (!tree.ok) return tree
+  const node = findNode(tree.tree, rel)
+  if (!node) return { ok: false, error: '树里找不到这个位置' }
+
+  const targets = node.children.slice(0, MAX_ASSESS)
+  if (targets.length === 0) return { ok: true, assessed: [], note: '这一层没有子项' }
+
+  let verdicts = verdictCache.get(rootAbs)
+  if (!verdicts) {
+    verdicts = new Map()
+    verdictCache.set(rootAbs, verdicts)
+  }
+  if (!regen && targets.every((child) => verdicts.has(child.path))) {
+    return {
+      ok: true,
+      assessed: targets.map((child) => ({ path: child.path, ...verdicts.get(child.path) })),
+      cached: true,
+    }
+  }
+
+  const lines = targets.map(
+    (child) => `- ${child.path}${child.kind === 'dir' ? '/' : ''}（${child.fileCount} 个文件${child.hasCode ? '，含代码' : ''}）`,
+  )
+  const prompt = [
+    `项目：${tree.name}`,
+    `下面是它这一层包含的 ${targets.length} 项。请判断每一项「改了会不会把项目搞坏」，只输出 JSON。`,
+    ...lines,
+    '',
+    '输出格式：',
+    '{"items":[{"path":"上面某一行的路径，一字不差","safety":"safe|careful|risky","why":"不超过 20 字"}]}',
+    '规则：每一项都要给一条；path 必须和上面完全一致；拿不准用 careful；只输出 JSON。',
+  ].join('\n')
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 90000)
+  try {
+    const call = await callModel(ctx, prompt, controller.signal, ASSESS_SYSTEM)
+    if (call.error) return { ok: false, error: call.error }
+    const parsed = parseJsonLoose(call.text)
+    const items = Array.isArray(parsed) ? parsed : parsed && Array.isArray(parsed.items) ? parsed.items : []
+    if (items.length === 0) return { ok: false, error: '模型这次没返回可用的判断' }
+
+    const known = new Map(targets.map((child) => [child.path, child]))
+    let counted = 0
+    for (const item of items) {
+      if (!item || typeof item.path !== 'string') continue
+      const path = item.path.replace(/\/+$/, '')
+      if (!known.has(path)) continue
+      const safety = ['safe', 'careful', 'risky'].includes(item.safety) ? item.safety : 'unknown'
+      verdicts.set(path, { safety, why: String(item.why ?? '').trim().slice(0, 40) })
+      counted += 1
+    }
+    return {
+      ok: true,
+      assessed: targets.map((child) => ({ path: child.path, ...(verdicts.get(child.path) ?? {}) })),
+      counted,
+      cached: false,
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /* ───────────────────────── 项目列表 ───────────────────────── */
 
 function projectList(ctx) {
@@ -1438,6 +1622,22 @@ export function apply(ctx) {
         const rel = url.searchParams.get('rel') ?? ''
         const regen = url.searchParams.get('regen') === '1'
         void detailFor(ctx, resolve(root), rel, { regen })
+          .then((payload) => json(res, 200, payload))
+          .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
+      },
+    },
+    {
+      kind: 'exact',
+      path: `${API}/assess`,
+      handler: (req, res) => {
+        if (req.method !== 'GET' && req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+        if (!requireSameOrigin(req, res)) return
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const root = url.searchParams.get('path')
+        if (!root) return json(res, 400, { ok: false, error: 'missing-path' })
+        const rel = url.searchParams.get('rel') ?? ''
+        const regen = url.searchParams.get('regen') === '1'
+        void assessFor(ctx, resolve(root), rel, regen)
           .then((payload) => json(res, 200, payload))
           .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
       },
