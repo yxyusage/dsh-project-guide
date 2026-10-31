@@ -161,9 +161,7 @@ window.__ModuleLoader__.load({
 			noMatch: 'No folder matches',
 		}
 
-		/* ───────────────────────── 样式 ───────────────────────── */
-
-		const CSS = `
+const CSS = `
 .lu-app{--lu-bg:var(--dsw-alias-bg-base,#131417);--lu-l1:var(--dsw-alias-bg-layer-1,#191b1f);--lu-l2:var(--dsw-alias-bg-layer-2,#202329);--lu-bd:var(--dsw-alias-border-l1,#2a2d34);--lu-bd2:var(--dsw-alias-border-l2,#3a3f48);--lu-fg:var(--dsw-alias-label-primary,#e9ebee);--lu-dim:var(--dsw-alias-label-secondary,#9aa1ab);--lu-idle:var(--dsw-alias-state-idle-primary,#6b7280);--lu-brand:var(--dsw-alias-brand-primary,#5b8cff);--lu-ok:var(--dsw-alias-state-success-primary,#3fb950);--lu-warn:var(--dsw-alias-state-warn-primary,#d29922);--lu-bad:var(--dsw-alias-state-error-primary,#f85149);
 display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu-fg);font:13.5px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;overflow:hidden}
 .lu-app *{box-sizing:border-box}
@@ -339,59 +337,22 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 .lu-switch.on{background:color-mix(in srgb,var(--lu-brand) 32%,transparent);border-color:var(--lu-brand)}
 .lu-switch.on i{left:18px;background:var(--lu-brand)}
 @media (max-width:900px){.lu-rail{width:200px}.lu-seg{min-width:72px}}
+
+.lu-row{display:flex;align-items:center;gap:6px;padding:4px 8px;border-radius:6px;font-size:12.5px;color:var(--lu-dim);cursor:pointer;user-select:none}
+.lu-row:hover{background:var(--lu-l2);color:var(--lu-fg)}
+.lu-row.on{background:var(--lu-l2);color:var(--lu-fg)}
+.lu-caret{width:16px;height:16px;line-height:1;display:flex;align-items:center;justify-content:center;border:0;background:none;color:var(--lu-idle);cursor:pointer;padding:0;font-size:9px;flex:none;border-radius:3px}
+.lu-caret:hover{background:var(--lu-bd);color:var(--lu-fg)}
+.lu-caret-space{width:16px;flex:none}
+.lu-rn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lu-rc{margin-left:auto;font-size:10.5px;color:var(--lu-idle);font-variant-numeric:tabular-nums;flex:none}
+.lu-ver{padding:6px 14px;font-size:10.5px;color:var(--lu-idle);border-top:1px solid var(--lu-bd)}
+.lu-row-meta{display:flex;align-items:center;gap:10px;margin:10px 0 6px;flex-wrap:wrap}
+.lu-badge{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--lu-bd2);color:var(--lu-dim);flex:none}
+.lu-badge.safe{color:var(--lu-ok);border-color:color-mix(in srgb,var(--lu-ok) 40%,transparent)}
+.lu-badge.risky{color:var(--lu-bad);border-color:color-mix(in srgb,var(--lu-bad) 40%,transparent)}
+.lu-badge.careful{color:var(--lu-warn);border-color:color-mix(in srgb,var(--lu-warn) 40%,transparent)}
 `
-
-		/* ───────────────────────── 小工具 ───────────────────────── */
-
-		const API = '/api/project-guide'
-
-		const readJson = async (url, options) => {
-			const response = await fetch(url, options)
-			let payload = null
-			try {
-				payload = await response.json()
-			} catch {
-				payload = null
-			}
-			if (!response.ok || !payload || payload.ok === false) {
-				throw new Error(payload && payload.error ? String(payload.error) : 'HTTP ' + response.status)
-			}
-			return payload
-		}
-
-		const storageGet = (key, fallback) => {
-			try {
-				const raw = window.localStorage.getItem(key)
-				return raw === null ? fallback : JSON.parse(raw)
-			} catch {
-				return fallback
-			}
-		}
-		const storageSet = (key, value) => {
-			try {
-				window.localStorage.setItem(key, JSON.stringify(value))
-			} catch {
-				/* 隐私模式下忽略 */
-			}
-		}
-
-		const safetyLabel = (safety, t) =>
-			safety === 'safe' ? t('safe') : safety === 'risky' ? t('risky') : t('careful')
-
-		const flatten = (nodes, out, seen) => {
-			const visited = seen || new Set()
-			for (const node of nodes) {
-				if (visited.has(node.path)) continue
-				visited.add(node.path)
-				out.push(node)
-				if (node.children && node.children.length > 0) flatten(node.children, out, visited)
-			}
-			return out
-		}
-
-		const matches = (text, query) => query === '' || String(text).toLowerCase().indexOf(query) >= 0
-
-		/* ───────────────────────── 图标 ───────────────────────── */
 
 		function GuideIcon(props) {
 			const size = typeof props.size === 'number' ? props.size : 20
@@ -417,262 +378,380 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 			)
 		}
 
-		/* ───────────────────────── 主组件 ───────────────────────── */
+		/* ───────────────────────── v2：树 + 详情 ───────────────────────── */
+
+		Object.assign(zh, {
+			treeHint: '点文件夹展开，点名字看它是什么',
+			selectHint: '点左边任意一行，这里会告诉你它是什么、改了会怎样。',
+			foldersLabel: '文件夹',
+			expand: '展开',
+			collapse: '折叠',
+			version: 'v2.0.0',
+			loadingNode: '正在读这一块…',
+			truncated: '目录太大，只展开了前面一部分',
+			types: '文件类型',
+			biggest: '最大的几块',
+			entries: '入口文件',
+			children: '里面有什么',
+			detailSoon: '更详细的架构说明，下一步接入。',
+			lines: '行数',
+			exportsLabel: '导出的东西',
+			importsLabel: '用到的东西',
+			commentLabel: '开头写着',
+		})
+
+		Object.assign(en, {
+			treeHint: 'Click a folder to expand, click a name to read it',
+			selectHint: 'Pick a row on the left; this pane explains what it is and what breaks if you change it.',
+			foldersLabel: 'Folders',
+			expand: 'Expand',
+			collapse: 'Collapse',
+			version: 'v2.0.0',
+			loadingNode: 'Reading this part…',
+			truncated: 'This tree is large; only part of it is expanded',
+			types: 'File types',
+			biggest: 'Largest areas',
+			entries: 'Entry files',
+			children: 'What is inside',
+			detailSoon: 'Deeper architecture notes arrive in the next step.',
+			lines: 'Lines',
+			exportsLabel: 'Exports',
+			importsLabel: 'Uses',
+			commentLabel: 'File header',
+		})
+
+		const API = '/api/project-guide'
+
+		const readJson = async (url, options) => {
+			try {
+				const res = await fetch(url, options)
+				const text = await res.text()
+				try {
+					return JSON.parse(text)
+				} catch {
+					return { ok: false, error: text.slice(0, 160) }
+				}
+			} catch (error) {
+				return { ok: false, error: String(error && error.message ? error.message : error) }
+			}
+		}
+
+		const storageGet = (key, fallback) => {
+			try {
+				const raw = localStorage.getItem(key)
+				return raw === null ? fallback : JSON.parse(raw)
+			} catch {
+				return fallback
+			}
+		}
+
+		const storageSet = (key, value) => {
+			try {
+				localStorage.setItem(key, JSON.stringify(value))
+			} catch {
+				/* 隐私模式忽略 */
+			}
+		}
+
+		/** 路径深度：'a' 为 0，'a/b' 为 1。 */
+		const depthOf = (path) => (path === '' ? -1 : path.split('/').length - 1)
+
+		const safetyLabel = (safety, t) =>
+			safety === 'safe' ? t('safe') : safety === 'risky' ? t('risky') : t('careful')
 
 		function GuidePage(props) {
 			const t = typeof props.t === 'function' ? props.t : (key) => zh[key] || key
 
 			const [stage, setStage] = useState('boot')
 			const [projectPath, setProjectPath] = useState('')
-			const [map, setMap] = useState(null)
-			const [phase, setPhase] = useState('')
+			const [tree, setTree] = useState(null)
 			const [error, setError] = useState('')
-			const [note, setNote] = useState('')
-			const [view, setView] = useState('home')
-			const [depth, setDepthState] = useState(() => {
-				const saved = storageGet('lu.depth', 'plain')
-				return saved === 'structure' || saved === 'code' ? saved : 'plain'
-			})
-			const [known, setKnown] = useState(() => new Set())
-			const [notes, setNotes] = useState({})
+			const [selected, setSelected] = useState('')
+			const [expanded, setExpanded] = useState(() => new Set(['']))
 			const [query, setQuery] = useState('')
-			const [editing, setEditing] = useState(false)
-			const [draft, setDraft] = useState('')
-			const [picker, setPicker] = useState(false)
+			const [facts, setFacts] = useState(null)
+			const [factsStage, setFactsStage] = useState('idle')
 			const [projects, setProjects] = useState([])
 			const [manual, setManual] = useState('')
+			const [picker, setPicker] = useState(false)
 			const [reload, setReload] = useState(0)
 			const [busy, setBusy] = useState(false)
-			const [settings, setSettings] = useState(() => {
-				const saved = storageGet('lu.settings', {})
-				const scope = saved && [6, 12, 18].indexOf(saved.scope) >= 0 ? saved.scope : 12
-				return { model: !saved || saved.model !== false, scope }
-			})
-			const [showSettings, setShowSettings] = useState(false)
-			const [file, setFile] = useState(null)
-			const [fileData, setFileData] = useState(null)
-			const [fileStatus, setFileStatus] = useState('idle')
-			const [fileNonce, setFileNonce] = useState(0)
-			const knownFor = useRef('')
+			const factsCache = useRef(new Map())
 
-			/* 已知的「懂了」按项目分开存 */
-			useEffect(() => {
-				if (!projectPath) return
-				const saved = storageGet('lu.known:' + projectPath, [])
-				knownFor.current = projectPath
-				setKnown(new Set(Array.isArray(saved) ? saved : []))
-				const savedNotes = storageGet('lu.notes:' + projectPath, {})
-				setNotes(savedNotes && typeof savedNotes === 'object' ? savedNotes : {})
-			}, [projectPath])
-
-			useEffect(() => {
-				if (!projectPath || knownFor.current !== projectPath) return
-				storageSet('lu.known:' + projectPath, [...known])
-			}, [known, projectPath])
-
-			/* 首次进入：问一下有哪些项目 */
+			/* 首次进入：先问有哪些项目 */
 			useEffect(() => {
 				let alive = true
-				readJson(API + '/projects')
-					.then((payload) => {
-						if (!alive) return
-						setProjects(Array.isArray(payload.projects) ? payload.projects : [])
-						const remembered = storageGet('lu.path', '')
-						const next = remembered || payload.defaultPath || (payload.projects[0] && payload.projects[0].path) || ''
-						if (next) {
-							setProjectPath(next)
-							setStage('loading')
-						} else {
-							setStage('pick')
-							setPicker(true)
-						}
-					})
-					.catch((err) => {
-						if (!alive) return
-						setError(String(err && err.message ? err.message : err))
-						setStage('error')
-					})
+				readJson(API + '/projects').then((payload) => {
+					if (!alive) return
+					if (payload.ok) setProjects(Array.isArray(payload.projects) ? payload.projects : [])
+					const remembered = storageGet('lu.path', '')
+					const next = remembered || payload.defaultPath || (payload.projects && payload.projects[0] && payload.projects[0].path) || ''
+					if (next) setProjectPath(next)
+					else {
+						setStage('boot')
+					}
+				})
 				return () => {
 					alive = false
 				}
 			}, [])
 
-			/* 拉地图：生成中就轮询 */
+			/* 读整棵树：一次 readdir 扫描，不调模型 */
 			useEffect(() => {
 				if (!projectPath) return undefined
 				let alive = true
-				let timer = null
 				setStage('loading')
-				setPhase('')
-
-				const tick = () => {
-					const url =
-						API + '/map?path=' + encodeURIComponent(projectPath) +
-						'&model=' + (settings.model ? '1' : '0') +
-						'&limit=' + settings.scope
-					readJson(url)
-						.then((payload) => {
-							if (!alive) return
-							if (payload.status === 'ready') {
-								setMap(payload.map)
-								setNote(payload.note || '')
-								setStage('ready')
-								setView('home')
-								return
-							}
-							if (payload.status === 'generating') {
-								setPhase(payload.phase || '')
-								timer = setTimeout(tick, 1100)
-								return
-							}
-							setError(t('error'))
-							setStage('error')
-						})
-						.catch((err) => {
-							if (!alive) return
-							setError(String(err && err.message ? err.message : err))
-							setStage('error')
-						})
-				}
-				tick()
-				return () => {
-					alive = false
-					if (timer) clearTimeout(timer)
-				}
-			}, [projectPath, reload, settings.model, settings.scope])
-
-			const mapUrl = useCallback(
-				(force) =>
-					(force ? API + '/refresh' : API + '/map') +
-					'?path=' + encodeURIComponent(projectPath) +
-					'&model=' + (settings.model ? '1' : '0') +
-					'&limit=' + settings.scope,
-				[projectPath, settings.model, settings.scope],
-			)
-
-			const applySettings = (patch) => {
-				const next = Object.assign({}, settings, patch)
-				setSettings(next)
-				storageSet('lu.settings', next)
-				setMap(null)
-				setReload((n) => n + 1)
-			}
-
-			const openProject = useCallback((nextPath) => {
-				const clean = String(nextPath || '').trim()
-				if (!clean) return
-				storageSet('lu.path', clean)
-				setPicker(false)
-				setManual('')
-				setMap(null)
-				setFile(null)
-				setFileData(null)
-				setProjectPath(clean)
-				setStage('loading')
-				setReload((n) => n + 1)
-			}, [])
-
-			/* 点开一个文件：只读这一个，不整份上传 */
-			useEffect(() => {
-				if (!file || !projectPath) return undefined
-				let alive = true
-				setFileStatus('loading')
-				setFileData(null)
-				const url =
-					API + '/file?path=' + encodeURIComponent(projectPath) +
-					'&rel=' + encodeURIComponent(file) +
-					'&model=' + (settings.model ? '1' : '0')
+				setError('')
+				const url = API + '/tree?path=' + encodeURIComponent(projectPath) + (reload > 0 ? '&refresh=1' : '')
 				readJson(url)
 					.then((payload) => {
 						if (!alive) return
-						setFileData(payload)
-						setFileStatus('ready')
+						if (!payload.ok) {
+							setError(payload.error || t('error'))
+							setStage('error')
+							return
+						}
+						factsCache.current = new Map()
+						setTree(payload)
+						setExpanded(new Set(['']))
+						setSelected('')
+						setStage('ready')
 					})
 					.catch((err) => {
 						if (!alive) return
-						setFileData({ ok: false, error: String(err && err.message ? err.message : err) })
-						setFileStatus('ready')
+						setError(String(err && err.message ? err.message : err))
+						setStage('error')
 					})
 				return () => {
 					alive = false
 				}
-			}, [file, fileNonce, projectPath, settings.model])
+			}, [projectPath, reload])
 
-			const allNodes = useMemo(() => (map ? flatten(map.nodes, [], new Set()) : []), [map])
-			const byId = useMemo(() => {
-				const table = {}
-				for (const node of allNodes) table[node.path] = node
-				return table
-			}, [allNodes])
+			/* 选中节点：拉事实（不调模型） */
+			useEffect(() => {
+				if (stage !== 'ready' || selected === null) return undefined
+				const cached = factsCache.current.get(selected)
+				if (cached) {
+					setFacts(cached)
+					setFactsStage('ready')
+					return undefined
+				}
+				let alive = true
+				setFactsStage('loading')
+				const url =
+					API + '/node?path=' + encodeURIComponent(projectPath) +
+					'&rel=' + encodeURIComponent(selected) +
+					'&refs=1'
+				readJson(url).then((payload) => {
+					if (!alive) return
+					factsCache.current.set(selected, payload)
+					setFacts(payload)
+					setFactsStage('ready')
+				})
+				return () => {
+					alive = false
+				}
+			}, [selected, stage, projectPath])
 
-			const current = view !== 'home' ? byId[view] : null
-			const activeFile =
-				file && (file === view || (view !== 'home' && file.startsWith(view + '/'))) ? file : null
-			const areas = map ? map.nodes.filter((node) => node.depth === 0) : []
-			const knownCount = areas.filter((node) => known.has(node.path)).length
-
-			const visibleTree = useMemo(() => {
-				const q = query.trim().toLowerCase()
-				if (!map) return []
-				if (q === '') return allNodes.filter((node) => node.depth <= 1)
-				return allNodes.filter((node) => node.depth <= 1 && matches(node.path, q))
-			}, [allNodes, query, map])
-
-			const setDepth = (next) => {
-				setDepthState(next)
-				storageSet('lu.depth', next)
+			const select = (node) => {
+				setSelected(node.path)
+				if (node.kind === 'dir') {
+					setExpanded((prev) => {
+						if (prev.has(node.path)) return prev
+						const next = new Set(prev)
+						next.add(node.path)
+						return next
+					})
+				}
 			}
 
-			const toggleKnown = () => {
-				if (!current) return
-				const next = new Set(known)
-				if (next.has(current.path)) next.delete(current.path)
-				else next.add(current.path)
-				setKnown(next)
+			const toggle = (path) => {
+				setExpanded((prev) => {
+					const next = new Set(prev)
+					if (next.has(path)) next.delete(path)
+					else next.add(path)
+					return next
+				})
 			}
 
-			const submitNote = () => {
-				const value = draft.trim()
-				if (value === '') return
-				const next = Object.assign({}, notes, { [view]: value })
-				setNotes(next)
-				storageSet('lu.notes:' + projectPath, next)
-				setEditing(false)
-				setDraft('')
+			const openProject = (nextPath) => {
+				const clean = String(nextPath || '').trim()
+				if (clean === '') return
+				storageSet('lu.path', clean)
+				setPicker(false)
+				setManual('')
+				setTree(null)
+				setFacts(null)
+				setFactsStage('idle')
+				setSelected('')
+				setProjectPath(clean)
+				setReload(0)
 			}
 
 			const refresh = () => {
-				if (busy || !projectPath) return
+				if (busy) return
 				setBusy(true)
-				readJson(mapUrl(true), { method: 'POST' })
-					.then(() => {
-						setReload((n) => n + 1)
-					})
-					.catch((err) => {
-						setError(String(err && err.message ? err.message : err))
-						setStage('error')
-					})
-					.finally(() => setBusy(false))
+				setReload((n) => n + 1)
+				setTimeout(() => setBusy(false), 600)
 			}
 
-			/* ---------- 结构块 ---------- */
+			/* 展开后的行：查询时给平铺结果，否则给树 */
+			const rows = useMemo(() => {
+				if (!tree) return []
+				const q = query.trim().toLowerCase()
+				if (q !== '') {
+					const out = []
+					const visit = (node) => {
+						if (node.path !== '' && (node.name.toLowerCase().indexOf(q) >= 0 || node.path.toLowerCase().indexOf(q) >= 0)) {
+							out.push({ node, depth: Math.max(0, depthOf(node.path)) })
+						}
+						for (const child of node.children) visit(child)
+					}
+					visit(tree.tree)
+					return out
+				}
+				const out = []
+				const walk = (node, depth) => {
+					out.push({ node, depth })
+					if (node.kind === 'dir' && expanded.has(node.path)) {
+						for (const child of node.children) walk(child, depth + 1)
+					}
+				}
+				walk(tree.tree, 0)
+				return out
+			}, [tree, expanded, query])
 
-			const railNode = (node) => {
-				const active = view === node.path
+			const rowFor = (entry) => {
+				const { node, depth } = entry
+				const isOpen = expanded.has(node.path)
+				const isRoot = node.path === ''
 				return h(
-					'button',
+					'div',
 					{
-						key: node.path,
-						className: 'lu-node' + (node.depth === 1 ? ' d1' : '') + (active ? ' on' : ''),
-						onClick: () => {
-							setView(node.path)
-							setEditing(false)
-						},
-						title: node.title ? node.title + ' · ' + node.path : node.path,
+						key: node.path === '' ? '__root' : node.path,
+						className: 'lu-row' + (selected === node.path ? ' on' : '') + (node.kind === 'file' ? ' file' : ''),
+						style: { paddingLeft: 8 + depth * 14 },
+						onClick: () => select(node),
+						title: node.path || tree.name,
 					},
-					known.has(node.path) ? h('span', { className: 'lu-dot' }) : null,
-					h('span', { className: 'lu-nm' }, node.name),
-					h('span', { className: 'lu-ct' }, node.fileCount),
+					node.kind === 'dir'
+						? h(
+								'button',
+								{
+									className: 'lu-caret' + (isOpen ? ' open' : ''),
+									onClick: (event) => {
+										event.stopPropagation()
+										toggle(node.path)
+									},
+									'aria-label': isOpen ? t('collapse') : t('expand'),
+									'aria-expanded': isOpen ? 'true' : 'false',
+								},
+								isOpen ? '▾' : '▸',
+							)
+						: h('span', { className: 'lu-caret-space' }),
+					h('span', { className: 'lu-rn' }, isRoot ? tree.name : node.name),
+					node.kind === 'dir' ? h('span', { className: 'lu-rc' }, node.fileCount) : null,
+				)
+			}
+
+			const safetyBadge = (safety) =>
+				h('span', { className: 'lu-badge ' + (safety || 'careful') }, safetyLabel(safety, t))
+
+			const childrenList = (factsNode) => {
+				const items = (factsNode.children || []).filter((child) => child.kind === 'file').slice(0, 40)
+				const dirs = (factsNode.children || []).filter((child) => child.kind === 'dir')
+				if (items.length === 0 && dirs.length === 0) return null
+				return h(
+					'div',
+					{ className: 'lu-sec' },
+					h('div', { className: 'lu-sec-h' }, h('h2', null, t('children'))),
+					h(
+						'div',
+						{ className: 'lu-files' },
+						dirs.map((child) =>
+							h(
+								'button',
+								{ key: child.path, className: 'lu-file-row', onClick: () => setSelected(child.path) },
+								h('span', { className: 'lu-file-nm' }, child.name + '/'),
+								h('span', { className: 'lu-file-go' }, child.fileCount),
+							),
+						),
+						items.map((child) =>
+							h(
+								'button',
+								{ key: child.path, className: 'lu-file-row', onClick: () => setSelected(child.path) },
+								h('span', { className: 'lu-file-nm' }, child.name),
+								h('span', { className: 'lu-file-go' }, '›'),
+							),
+						),
+					),
+				)
+			}
+
+			const statsBlock = () => {
+				if (!tree || !tree.stats) return null
+				const s = tree.stats
+				const langs = (s.languages || []).map((item) => item[0] + '×' + item[1]).join('  ')
+				return h(
+					'div',
+					{ className: 'lu-sec' },
+					h('div', { className: 'lu-sec-h' }, h('h2', null, t('overview'))),
+					h(
+						'ul',
+						{ className: 'lu-kv' },
+						h('li', null, h('span', { className: 'k' }, t('files')), h('span', null, String(s.files))),
+						h('li', null, h('span', { className: 'k' }, t('foldersLabel')), h('span', null, String(s.dirs))),
+						langs !== '' ? h('li', null, h('span', { className: 'k' }, t('types')), h('span', null, langs)) : null,
+						(s.entries || []).length > 0
+							? h('li', null, h('span', { className: 'k' }, t('entries')), h('span', null, s.entries.join('、')))
+							: null,
+						(s.biggest || []).length > 0
+							? h('li', null, h('span', { className: 'k' }, t('biggest')), h('span', null, s.biggest.map((item) => item.name + '(' + item.fileCount + ')').join('、')))
+							: null,
+					),
+					s.truncated ? h('p', { className: 'lu-why' }, t('truncated')) : null,
+				)
+			}
+
+			const pane = () => {
+				if (factsStage === 'loading') {
+					return h('div', { className: 'lu-center' }, h('div', { className: 'lu-spin' }), h('h3', null, t('loadingNode')))
+				}
+				if (!facts) return h('div', { className: 'lu-center' }, h('h3', null, t('empty')), h('p', null, t('selectHint')))
+				if (facts.ok === false) {
+					return h('div', { className: 'lu-center' }, h('h3', null, t('error')), h('p', null, facts.error || ''))
+				}
+				const summary = facts.summary || {}
+				const isRoot = facts.path === ''
+				const factRows = []
+				if (facts.kind === 'file') {
+					factRows.push(h('li', { key: 'l' }, h('span', { className: 'k' }, t('lines')), h('span', null, String(facts.lines))))
+					if ((facts.exports || []).length > 0) factRows.push(h('li', { key: 'e' }, h('span', { className: 'k' }, t('exportsLabel')), h('span', null, facts.exports.slice(0, 8).join('、'))))
+					if ((facts.imports || []).length > 0) factRows.push(h('li', { key: 'i' }, h('span', { className: 'k' }, t('importsLabel')), h('span', null, facts.imports.slice(0, 8).join('、'))))
+				} else {
+					factRows.push(h('li', { key: 'f' }, h('span', { className: 'k' }, t('files')), h('span', null, String(facts.fileCount))))
+					factRows.push(h('li', { key: 't' }, h('span', { className: 'k' }, t('types')), h('span', null, (facts.ext || []).map((item) => item[0] + '×' + item[1]).join('  ') || '—')))
+				}
+				return h(
+					'div',
+					{ className: 'lu-scroll' },
+					h(
+						'div',
+						{ className: 'lu-page' },
+						h('div', { className: 'lu-eyebrow' }, isRoot ? t('overview') : facts.kind === 'dir' ? t('foldersLabel') : t('files')),
+						h('h1', { className: 'lu-h1' }, summary.title || facts.name),
+						summary.oneLine ? h('p', { className: 'lu-lede' }, summary.oneLine) : null,
+						h('div', { className: 'lu-row-meta' }, h('code', { className: 'lu-crumb' }, facts.path || (tree ? tree.root : '')), safetyBadge(summary.safety)),
+						summary.say ? h('p', { className: 'lu-body' }, summary.say) : null,
+						summary.effect ? h('div', { className: 'lu-call' }, h('div', { className: 'lu-call-h' }, t('effect')), h('p', null, summary.effect)) : null,
+						isRoot ? statsBlock() : null,
+						h('div', { className: 'lu-sec' }, h('ul', { className: 'lu-kv' }, factRows)),
+						facts.kind === 'file' && facts.comment
+							? h('div', { className: 'lu-sec' }, h('div', { className: 'lu-sec-h' }, h('h2', null, t('commentLabel'))), h('p', { className: 'lu-body' }, facts.comment))
+							: null,
+						facts.kind === 'dir' ? childrenList(facts) : null,
+						h('p', { className: 'lu-why' }, t('detailSoon')),
+					),
 				)
 			}
 
@@ -685,16 +764,10 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 					h(
 						'div',
 						{ className: 'lu-proj-row' },
-						h('div', { className: 'lu-proj-name', title: map ? map.root : projectPath }, map ? map.name : '…'),
-						projectPath
-							? h('button', { className: 'lu-pick', onClick: () => setPicker(true) }, t('pick'))
-							: null,
+						h('div', { className: 'lu-proj-name', title: projectPath }, tree ? tree.name : '…'),
+						projectPath ? h('button', { className: 'lu-pick', onClick: () => setPicker(true) }, t('pick')) : null,
 					),
-					h(
-						'div',
-						{ className: 'lu-proj-meta' },
-						map ? map.stats.files + ' ' + t('files') + ' · ' + areas.length + ' ' + t('areas') : t('subtitle'),
-					),
+					h('div', { className: 'lu-proj-meta' }, tree ? t('treeHint') : t('subtitle')),
 				),
 				h(
 					'div',
@@ -709,607 +782,33 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 				h(
 					'nav',
 					{ className: 'lu-tree' },
-					stage === 'ready'
-						? [
-								h(
-									'button',
-									{
-										key: '__home',
-										className: 'lu-node' + (view === 'home' ? ' on' : ''),
-										onClick: () => {
-											setView('home')
-											setEditing(false)
-										},
-									},
-									h('span', { className: 'lu-nm' }, t('overview')),
-								),
-								...visibleTree.map(railNode),
-								visibleTree.length === 0 && query !== ''
-									? h('div', { key: '__none', className: 'lu-empty-tree' }, t('noMatch'))
-									: null,
-							]
-						: null,
+					stage === 'ready' ? rows.map(rowFor) : null,
+					stage === 'ready' && rows.length === 0 && query !== '' ? h('div', { className: 'lu-empty-tree' }, t('noMatch')) : null,
 				),
-				map
-					? h(
-							'div',
-							{ className: 'lu-progress' },
-							t('known') + ' ' + knownCount + ' / ' + areas.length,
-							h('div', { className: 'lu-track' }, h('i', { style: { width: (areas.length === 0 ? 0 : (knownCount / areas.length) * 100) + '%' } })),
-						)
-					: null,
+				h('div', { className: 'lu-ver' }, t('version')),
 			)
-
-			/* ---------- 顶栏 ---------- */
-
-			const crumbText = activeFile || (current ? current.path : t('overview'))
-			const crumb = h('div', { className: 'lu-crumb' }, h('b', null, map ? map.name : ''), ' / ', crumbText)
 
 			const top = h(
 				'header',
 				{ className: 'lu-top' },
-				crumb,
+				h('div', { className: 'lu-crumb' }, h('b', null, tree ? tree.name : ''), ' / ', selected === '' ? t('overview') : selected),
 				h('div', { className: 'lu-spacer' }),
-				activeFile
-					? h('button', { className: 'lu-btn', onClick: () => setFile(null) }, '← ' + t('back'))
-					: null,
-				current
-					? h(
-							'div',
-							{ className: 'lu-tools' },
-							h(
-								'div',
-								{ className: 'lu-segs' },
-								h('button', { className: depth === 'plain' ? 'on' : '', onClick: () => setDepth('plain') }, t('plain')),
-								h('button', { className: depth === 'structure' ? 'on' : '', onClick: () => setDepth('structure') }, t('structureDepth')),
-								h('button', { className: depth === 'code' ? 'on' : '', onClick: () => setDepth('code') }, t('code')),
-							),
-							h(
-								'button',
-								{ className: 'lu-got' + (known.has(current.path) ? ' ok' : ''), onClick: toggleKnown },
-								known.has(current.path) ? '✓ ' + t('known') : '✓ ' + t('gotIt'),
-							),
-							h(
-								'button',
-								{ className: 'lu-got', onClick: () => { setEditing(true); setDraft(notes[current.path] || '') } },
-								t('wrong'),
-							),
-						)
-					: null,
-				h(
-					'button',
-					{
-						className: 'lu-btn',
-						onClick: () => setShowSettings((value) => !value),
-						title: t('settings'),
-						'aria-label': t('settings'),
-					},
-					'⚙',
-				),
-				h(
-					'button',
-					{ className: 'lu-btn', onClick: refresh, disabled: busy || stage !== 'ready', title: t('refresh') },
-					busy ? t('refreshing') : t('refresh'),
-				),
+				h('button', { className: 'lu-btn', onClick: refresh, disabled: busy }, busy ? t('refreshing') : t('refresh')),
 			)
 
-			/* ---------- 导览 ---------- */
-
-			const overview = () =>
-				h(
-					'div',
-					{ className: 'lu-page' },
-					h('div', { className: 'lu-eyebrow' }, t('overview')),
-					h('h1', { className: 'lu-h1' }, map.name),
-					h(
-						'div',
-						{ className: 'lu-lede' },
-						note ? t('factsOnly') + ' · ' + note : t('narrated'),
-					),
-					h('ul', { className: 'lu-sum' }, (map.summary || []).map((line, index) => h('li', { key: index }, line))),
-
-					h(
-						'div',
-						{ className: 'lu-sec' },
-						h('div', { className: 'lu-sec-h' }, h('h2', null, t('structure')), h('span', null, '按文件多少排的')),
-						h(
-							'div',
-							{ className: 'lu-comp' },
-							areas.map((node) =>
-								h('i', {
-									key: node.path,
-									className: node.safety || 'careful',
-									style: { flexGrow: Math.min(node.fileCount, 30) + 1 },
-								}),
-							),
-						),
-						h(
-							'div',
-							{ className: 'lu-parts' },
-							areas.map((node) =>
-								h(
-									'button',
-									{
-										key: node.path,
-										className: 'lu-part',
-										onClick: () => setView(node.path),
-										title: node.path,
-									},
-									h(
-										'span',
-										{ className: 'lu-pname' },
-										known.has(node.path) ? h('span', { className: 'lu-dot' }) : null,
-										node.title || node.name,
-									),
-									h('span', { className: 'lu-psay' }, node.oneLine),
-									h('span', { className: 'lu-pct' }, node.fileCount),
-									h('span', { className: 'lu-pchev' }, '›'),
-								),
-							),
-						),
-					),
-
-					map.route && map.route.length > 0
-						? h(
-								'div',
-								{ className: 'lu-sec' },
-								h('div', { className: 'lu-sec-h' }, h('h2', null, t('route')), h('span', null, t('routeHint'))),
-								h(
-									'ol',
-									{ className: 'lu-route' },
-									map.route.map((step, index) =>
-										h(
-											'li',
-											{ key: index },
-											h('div', { className: 'lu-num' }, index + 1),
-											h(
-												'div',
-												null,
-												h('b', null, h('span', { className: 'lu-file' }, step.file)),
-												h('div', { className: 'lu-why' }, step.why),
-											),
-										),
-									),
-								),
-							)
-						: null,
-
-					map.ignore && map.ignore.length > 0
-						? h(
-								'div',
-								{ className: 'lu-sec' },
-								h('div', { className: 'lu-sec-h' }, h('h2', null, t('ignore')), h('span', null, t('ignoreHint'))),
-								h(
-									'details',
-									{ className: 'lu-fold' },
-									h('summary', null, map.ignore.length + ' 个，看了也没用'),
-									h(
-										'div',
-										{ className: 'lu-ig' },
-										map.ignore.map((row, index) =>
-											h(
-												'div',
-												{ key: index, className: 'lu-ig-row' },
-												h('code', null, row.name),
-												h('span', null, row.why || '给工具看的，不是给你看的。'),
-											),
-										),
-									),
-								),
-							)
-						: null,
-				)
-
-			/* ---------- 文件夹卡片 ---------- */
-
-			const effectLine = (node) => {
-				if (depth === 'code') {
-					const ext = (node.ext || []).map(([name, count]) => name + '×' + count).join(' ')
-					return (
-						'这个文件夹里 ' + node.fileCount + ' 个文件' +
-						(ext ? '（' + ext + '）' : '') +
-						(node.importedBy && node.importedBy.length > 0 ? '；被 ' + node.importedBy.length + ' 处引用' : '；没有被别处引用') +
-						(node.imports && node.imports.length > 0 ? '；它引用了 ' + node.imports.join('、') : '') +
-						'。'
-					)
-				}
-				return node.plain.effect
-			}
-
-			const card = () => {
-				const node = current
-				const isKnown = known.has(node.path)
-				// 副标题常常就是正文的第一句，重复读一遍很傻：能拆开就拆开，拆不开就只留正文
-				const sub = String(node.oneLine || '').replace(/…$/, '')
-				const lead = node.plain.lead || ''
-				const duplicated = sub !== '' && lead.startsWith(sub) && /^[。！？；，、\s]/.test(lead.slice(sub.length))
-				const stripped = duplicated ? lead.slice(sub.length).replace(/^[。！？；，、\s]+/, '') : lead
-				const split = duplicated && stripped.length >= 8
-				const bodyText = split ? stripped : lead
-				const showSub = duplicated ? split : true
-				const body =
-					depth === 'plain'
-						? h(
-								react.Fragment,
-								null,
-								bodyText !== '' ? h('p', { className: 'lu-body' }, bodyText) : null,
-								node.plain.say ? h('p', { className: 'lu-say' }, node.plain.say) : null,
-							)
-						: bodyText !== ''
-							? h('p', { className: 'lu-body' }, bodyText)
-							: null
-
-				const facts =
-					depth === 'code'
-						? h(
-								'ul',
-								{ className: 'lu-kv' },
-								h('li', null, h('span', { className: 'k' }, '路径'), h('span', null, node.path)),
-								h('li', null, h('span', { className: 'k' }, '文件'), h('span', null, node.fileCount + ' 个' + ((node.files || []).length > 0 ? '：' + node.files.join('、') : ''))),
-								node.importedBy && node.importedBy.length > 0
-									? h('li', null, h('span', { className: 'k' }, '被引用'), h('span', null, node.importedBy.join('、')))
-									: null,
-								node.imports && node.imports.length > 0
-									? h('li', null, h('span', { className: 'k' }, '引用了'), h('span', null, node.imports.join('、')))
-									: null,
-							)
-						: null
-
-				return h(
-					'div',
-					{ className: 'lu-page' },
-					h(
-						'div',
-						{ className: 'lu-hero' },
-						h(
-							'div',
-							null,
-							h('h1', { className: 'lu-h1', style: { marginTop: 0 } }, node.title || node.name),
-							showSub ? h('div', { className: 'lu-lede' }, node.oneLine) : null,
-						),
-						h('span', { className: 'lu-pill ' + (node.safety || 'careful') }, safetyLabel(node.safety, t)),
-					),
-
-					notes[node.path]
-						? h('div', { className: 'lu-note' }, h('b', null, t('noteTitle')), notes[node.path])
-						: null,
-
-					h(
-						'div',
-						{ className: 'lu-call' },
-						h('div', { className: 'lu-call-h' }, depth === 'code' ? '这一层的事实' : t('effect')),
-						h('p', null, effectLine(node)),
-					),
-
-					body,
-					facts,
-
-					node.kind === 'dir' && depth !== 'code' && node.files && node.files.length > 0
-						? h(
-								'div',
-								{ className: 'lu-sec' },
-								h('div', { className: 'lu-sec-h' }, h('h2', null, t('inside')), h('span', null, t('openFileHint'))),
-								h(
-									'div',
-									{ className: 'lu-files' },
-									node.files.map((name) =>
-										h(
-											'button',
-											{
-												key: name,
-												className: 'lu-file-row',
-												onClick: () => {
-													setFile(node.kind === 'file' ? node.path : node.path + '/' + name)
-													setFileNonce((n) => n + 1)
-												},
-											},
-											h('span', { className: 'lu-file-nm' }, name),
-											h('span', { className: 'lu-file-go' }, '›'),
-										),
-									),
-								),
-							)
-						: null,
-
-					node.related && node.related.length > 0
-						? h(
-								'div',
-								{ className: 'lu-sec' },
-								h('div', { className: 'lu-sec-h' }, h('h2', null, t('related'))),
-								h('div', { className: 'lu-chips' }, node.related.map((rel, index) => h('span', { key: index, className: 'lu-chip' }, rel))),
-							)
-						: h(
-								'div',
-								{ className: 'lu-sec' },
-								h('div', { className: 'lu-sec-h' }, h('h2', null, t('related'))),
-								h('div', { className: 'lu-why' }, '代码里没有直接引用它的地方，改动波及别处的可能性较小。'),
-							),
-
-					node.deeper
-						? h(
-								'div',
-								{ className: 'lu-deep' },
-								h('div', { className: 'lu-deep-row' }, h('div', { className: 'lu-deep-k' }, t('deeper')), h('div', { className: 'lu-deep-v' }, '去搜：' + node.deeper.search)),
-								h('div', { className: 'lu-deep-row' }, h('div', { className: 'lu-deep-k' }), h('div', { className: 'lu-deep-v' }, '去读：', h('code', null, node.deeper.read))),
-								h('div', { className: 'lu-deep-row' }, h('div', { className: 'lu-deep-k' }, '问 AI'), h('div', { className: 'lu-deep-v' }, '“' + node.deeper.ask + '”', h('em', null, '把这句话发到对话里就行。'))),
-							)
-						: null,
-
-					isKnown
-						? h(
-								'div',
-								{ className: 'lu-call', style: { marginTop: 22, borderLeftColor: 'var(--lu-ok)' } },
-								h('p', { style: { color: 'var(--lu-dim)' } }, '这块你标过「懂了」，所以只留一句提醒。'),
-							)
-						: null,
-
-					(() => {
-						const index = areas.findIndex((item) => item.path === node.path)
-						if (index < 0) return null
-						const before = index > 0 ? areas[index - 1] : null
-						const after = index < areas.length - 1 ? areas[index + 1] : null
-						if (!before && !after) return null
-						return h(
-							'div',
-							{ className: 'lu-nav' },
-							before
-								? h('button', { className: 'lu-navbtn', onClick: () => setView(before.path) }, '← ' + (before.title || before.name))
-								: h('span', { className: 'lu-navbtn empty' }),
-							after
-								? h('button', { className: 'lu-navbtn next', onClick: () => setView(after.path) }, (after.title || after.name) + ' →')
-								: h('span', { className: 'lu-navbtn empty' }),
-						)
-					})(),
-
-					editing
-						? h(
-								'div',
-								{ className: 'lu-noteform' },
-								h('textarea', {
-									autoFocus: true,
-									value: draft,
-									placeholder: t('notePlaceholder'),
-									onChange: (event) => setDraft(event.target.value),
-									onKeyDown: (event) => {
-										if (event.key === 'Escape') {
-											setEditing(false)
-											setDraft('')
-										}
-									},
-								}),
-								h(
-									'div',
-									{ className: 'lu-row' },
-									h('button', { className: 'lu-btn', onClick: submitNote }, t('noteSubmit')),
-									h('button', { className: 'lu-btn', onClick: () => { setEditing(false); setDraft('') } }, t('noteCancel')),
-									h('span', { className: 'lu-why', style: { marginTop: 0 } }, t('noteSaved')),
-								),
-							)
-						: null,
-				)
-			}
-
-			/* ---------- 文件卡片 ---------- */
-
-			const fileCard = () => {
-				const name = String(activeFile || '').split('/').pop()
-				if (!fileData) {
-					return h(
-						'div',
-						{ className: 'lu-page' },
-						h('div', { className: 'lu-eyebrow' }, t('fileLoading')),
-						h('h1', { className: 'lu-h1' }, name),
-						h('div', { className: 'lu-lede' }, t('fileLoadingHint')),
-						h('div', { className: 'lu-prog', style: { marginTop: 20, width: '100%' } }, h('i')),
-					)
-				}
-				if (fileData.ok === false) {
-					return h(
-						'div',
-						{ className: 'lu-page' },
-						h('h1', { className: 'lu-h1' }, name),
-						h(
-							'div',
-							{ className: 'lu-call' },
-							h('div', { className: 'lu-call-h' }, t('fileError')),
-							h('p', null, fileData.error || ''),
-						),
-						h(
-							'div',
-							{ className: 'lu-card-foot' },
-							h('button', { className: 'lu-btn', onClick: () => setFileNonce((n) => n + 1) }, t('fileRetry')),
-							h('button', { className: 'lu-btn', onClick: () => setFile(null) }, '← ' + t('back')),
-						),
-					)
-				}
-				const card = fileData.card
-				const safety = (card && card.safety) || 'careful'
-				return h(
-					'div',
-					{ className: 'lu-page' },
-					h(
-						'div',
-						{ className: 'lu-hero' },
-						h(
-							'div',
-							null,
-							h('h1', { className: 'lu-h1', style: { marginTop: 0 } }, (card && card.title) || name),
-							h('div', { className: 'lu-lede' }, (card && card.gist) || fileData.lines + ' 行'),
-						),
-						h('span', { className: 'lu-pill ' + safety }, safetyLabel(safety, t)),
-					),
-					card && card.risk
-						? h('div', { className: 'lu-call' }, h('div', { className: 'lu-call-h' }, t('effect')), h('p', null, card.risk))
-						: null,
-					card && card.does
-						? h(
-								'div',
-								{ className: 'lu-sec' },
-								h('div', { className: 'lu-sec-h' }, h('h2', null, t('whatItDoes'))),
-								h('p', { className: 'lu-body', style: { marginTop: 0 } }, card.does),
-							)
-						: null,
-					h(
-						'ul',
-						{ className: 'lu-kv', style: { marginTop: 18 } },
-						h('li', null, h('span', { className: 'k' }, t('takesIn')), h('span', null, (card && card.takeIn) || '—')),
-						h('li', null, h('span', { className: 'k' }, t('givesOut')), h('span', null, (card && card.giveOut) || '—')),
-						h('li', null, h('span', { className: 'k' }, '行数'), h('span', null, String(fileData.lines))),
-					),
-					fileData.names && fileData.names.length > 0
-						? h(
-								'div',
-								{ className: 'lu-sec' },
-								h('div', { className: 'lu-sec-h' }, h('h2', null, t('keyNames'))),
-								h('div', { className: 'lu-chips' }, fileData.names.map((n) => h('span', { key: n, className: 'lu-chip' }, n))),
-							)
-						: null,
-					depth === 'code' && fileData.excerpt
-						? h(
-								'div',
-								{ className: 'lu-sec' },
-								h('div', { className: 'lu-sec-h' }, h('h2', null, '代码开头'), h('span', null, '前 40 行')),
-								h('pre', { className: 'lu-code' }, fileData.excerpt),
-							)
-						: null,
-					h(
-						'div',
-						{ className: 'lu-card-foot' },
-						h('button', { className: 'lu-btn', onClick: () => setFile(null) }, '← ' + t('back')),
-						h('button', { className: 'lu-btn', onClick: () => setFileNonce((n) => n + 1) }, t('fileRetry')),
-					),
-					h('div', { className: 'lu-fineprint' }, card ? t('fileNote') : fileData.note || t('fileFactsOnly')),
-				)
-			}
-
-			/* ---------- 设置页 ---------- */
-
-			const settingsPage = () =>
-				h(
-					'div',
-					{ className: 'lu-page' },
-					h('div', { className: 'lu-eyebrow' }, t('settings')),
-					h('h1', { className: 'lu-h1' }, t('settings')),
-					h('div', { className: 'lu-lede' }, t('settingsHint')),
-					h(
-						'div',
-						{ className: 'lu-sec' },
-						h(
-							'div',
-							{ className: 'lu-pop-row' },
-							h(
-								'div',
-								{ className: 'lu-pop-t' },
-								h('b', null, t('useModel')),
-								h('small', null, t('useModelHint')),
-							),
-							h(
-								'button',
-								{
-									className: 'lu-switch' + (settings.model ? ' on' : ''),
-									onClick: () => applySettings({ model: !settings.model }),
-									'aria-pressed': settings.model,
-									'aria-label': t('useModel'),
-								},
-								h('i'),
-							),
-						),
-						h(
-							'div',
-							{ className: 'lu-pop-row' },
-							h(
-								'div',
-								{ className: 'lu-pop-t' },
-								h('b', null, t('scope')),
-								h('small', null, t('scopeHint')),
-							),
-							h(
-								'div',
-								{ className: 'lu-segs' },
-								[6, 12, 18].map((count) =>
-									h(
-										'button',
-										{
-											key: count,
-											className: settings.scope === count ? 'on' : '',
-											onClick: () => applySettings({ scope: count }),
-										},
-										count === 6 ? t('scopeFew') : count === 12 ? t('scopeNormal') : t('scopeMore'),
-									),
-								),
-							),
-						),
-					),
-					h(
-						'div',
-						{ className: 'lu-card-foot' },
-						h('button', { className: 'lu-btn', onClick: () => setShowSettings(false) }, '← ' + t('close')),
-					),
-					h('div', { className: 'lu-fineprint' }, t('settingsHint')),
-				)
-
-			/* ---------- 底部坞 ---------- */
-
-			const dock = current
-				? h(
-						'footer',
-						{ className: 'lu-dock' },
-						h(
-							'div',
-							{ className: 'lu-dock-l' },
-							h('span', { className: 'lu-dock-label' }, t('depth')),
-							h(
-								'div',
-								{ className: 'lu-segs' },
-								h('button', { className: depth === 'plain' ? 'on' : '', onClick: () => setDepth('plain') }, t('plain')),
-								h('button', { className: depth === 'structure' ? 'on' : '', onClick: () => setDepth('structure') }, t('structureDepth')),
-								h('button', { className: depth === 'code' ? 'on' : '', onClick: () => setDepth('code') }, t('code')),
-							),
-							h('span', { className: 'lu-dock-sep' }),
-							h(
-								'button',
-								{ className: 'lu-got' + (known.has(current.path) ? ' ok' : ''), onClick: toggleKnown },
-								known.has(current.path) ? '✓ ' + t('known') : '✓ ' + t('gotIt'),
-							),
-							h(
-								'button',
-								{ className: 'lu-got', onClick: () => { setEditing(true); setDraft(notes[current.path] || ''); } },
-								t('wrong'),
-							),
-						),
-					)
-				: null
-
-			/* ---------- 状态页 ---------- */
-
-			const center = (children) => h('div', { className: 'lu-center' }, ...children)
-
-			let mainBody = null
+			let body = null
 			if (stage === 'boot' || stage === 'loading') {
-				mainBody = center([
-					h('div', { key: 'a', className: 'lu-spin' }),
-					h('h3', { key: 'b' }, t('loading')),
-					h('p', { key: 'c' }, phase ? phase : t('loadingHint')),
-					h('div', { key: 'd', className: 'lu-prog' }, h('i')),
-				])
+				body = h('div', { className: 'lu-center' }, h('div', { className: 'lu-spin' }), h('h3', null, t('loading')), h('p', null, t('loadingHint')))
 			} else if (stage === 'error') {
-				mainBody = center([
-					h('h3', { key: 'a' }, t('error')),
-					h('p', { key: 'b' }, error),
-					h('button', { key: 'c', className: 'lu-btn', onClick: () => setPicker(true) }, t('pick')),
-				])
-			} else if (stage === 'pick') {
-				mainBody = center([
-					h('h3', { key: 'a' }, t('empty')),
-					h('p', { key: 'b' }, t('emptyHint')),
-					h('button', { key: 'c', className: 'lu-btn', onClick: () => setPicker(true) }, t('pick')),
-				])
-			} else if (map) {
-				mainBody = h(
+				body = h(
 					'div',
-					{ className: 'lu-scroll' },
-					showSettings ? settingsPage() : view === 'home' ? overview() : activeFile ? fileCard() : card(),
+					{ className: 'lu-center' },
+					h('h3', null, t('error')),
+					h('p', null, error),
+					h('button', { className: 'lu-btn', onClick: () => setReload((n) => n + 1) }, t('retry')),
 				)
+			} else {
+				body = pane()
 			}
 
 			return h(
@@ -1317,7 +816,7 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 				{ className: 'lu-app' },
 				h('style', null, CSS),
 				rail,
-				h('section', { className: 'lu-main' }, stage === 'ready' ? top : null, mainBody),
+				h('section', { className: 'lu-main' }, stage === 'ready' ? top : null, body),
 				picker
 					? h(
 							'div',
@@ -1346,7 +845,7 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 									{ className: 'lu-field' },
 									h('input', {
 										value: manual,
-										placeholder: map ? map.root : 'E:\\我的项目',
+										placeholder: tree ? tree.root : 'E:\\我的项目',
 										onChange: (event) => setManual(event.target.value),
 										onKeyDown: (event) => {
 											if (event.key === 'Enter') openProject(manual)
@@ -1354,11 +853,7 @@ display:flex;height:100%;min-height:460px;background:var(--lu-bg);color:var(--lu
 									}),
 									h('button', { className: 'lu-btn', onClick: () => openProject(manual) }, t('open')),
 								),
-								h(
-									'div',
-									{ className: 'lu-actions' },
-									h('button', { className: 'lu-btn', onClick: () => setPicker(false) }, t('close')),
-								),
+								h('div', { className: 'lu-actions' }, h('button', { className: 'lu-btn', onClick: () => setPicker(false) }, t('close'))),
 							),
 						)
 					: null,
