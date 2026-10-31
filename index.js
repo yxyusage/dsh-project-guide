@@ -1,11 +1,7 @@
-// dsh-project-guide — host half.
+// dsh-project-guide — host half (v2, tree-first).
 //
-// 把用户的项目目录翻译成「人话导览」：
-//   1. 事实层：目录树、文件数、谁引用谁 —— 自己算，不用模型，不会编。
-//   2. 人话层：项目是干什么的、先看哪几个文件、每个文件夹改了会怎样。
-//      常见文件夹名用本地词典（秒出、零成本）；其余交给当前默认模型补一份。
-//
-// 浏览器半通过同源 JSON 路由拿数据，不依赖任何 Remote 生成器。
+// 打开项目只做一件事：把整棵目录树扫出来（只 readdir，不读文件内容、不调模型）。
+// 解释按需生成：点开节点给事实，点「详细」才请模型写人话。
 import { readdir, stat, readFile } from 'node:fs/promises'
 import { join, resolve, extname, sep } from 'node:path'
 
@@ -29,23 +25,34 @@ const SKIP_FILES = new Set([
 ])
 
 const CODE_EXT = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.vue', '.svelte', '.astro'])
-const IGNORE_EXT = new Set(['.lock', '.map', '.ico', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ttf', '.woff', '.woff2'])
 
-/** 根目录里「像入口」的散文件，才值得进结构。 */
+/** 根目录里「像入口」的散文件，用于「从这看起」。 */
 const ENTRY_FILES = /^(index\.(html?|js|ts|jsx|tsx|vue)|main\.(js|mjs|ts|py|go|rs)|app\.(js|ts|py|vue)|server\.(js|ts|mjs)|manage\.py|Makefile|docker-compose\.ya?ml)$/i
 
-/** 递归文件数上限，防止在超大仓库里卡住。 */
-const MAX_WALK = 4000
-/** 进树的节点上限。 */
-const MAX_NODES = 26
+/** 目录树递归深度上限。 */
+const MAX_DEPTH = 8
+/** 树里节点总数上限，防止超大仓库把浏览器撑爆。 */
+const MAX_NODES_TREE = 5000
+/** 单个目录最多列出的文件数，超出部分标记截断。 */
+const MAX_FILES_LIST = 200
+/** 算引用关系时每个目录最多读的代码文件数。 */
+const MAX_REF_FILES = 30
+/** 单文件读取上限。 */
+const MAX_FILE_BYTES = 400 * 1024
+/** 发给模型的代码摘录行数。 */
+const CODE_EXCERPT_LINES = 140
+/** 目录树缓存存活时间；目录 mtime 不随深层变化，所以加个上限。 */
+const TREE_TTL = 30_000
 
-const cache = new Map()
-const inFlight = new Set()
+/** 中文 / 英文混排的稳定排序：文件夹在前，组内自然序。 */
+const collator = new Intl.Collator(['zh-Hans-CN', 'en'], { numeric: true, sensitivity: 'base' })
 
-/* ─────────────────────────── 工具 ─────────────────────────── */
+const treeCache = new Map()
+const detailCache = new Map()
 
 const slash = (p) => p.split(sep).join('/')
 const isCode = (f) => CODE_EXT.has(extname(f).toLowerCase())
+const joinPath = (base, name) => (base === '' ? name : base + '/' + name)
 
 function json(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
@@ -84,41 +91,181 @@ async function listDir(abs) {
   }
 }
 
-/** 递归数文件，并收集顶层可见的扩展名分布。 */
-async function measure(abs, budget) {
-  let count = 0
-  const ext = new Map()
-  const queue = [abs]
-  while (queue.length > 0 && count < budget.limit) {
-    const dir = queue.shift()
-    const entries = await listDir(dir)
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) continue
-        queue.push(join(dir, entry.name))
-        continue
-      }
-      if (!entry.isFile()) continue
-      count += 1
-      const e = extname(entry.name).toLowerCase() || '(无扩展名)'
-      ext.set(e, (ext.get(e) ?? 0) + 1)
-      if (count >= budget.limit) break
-    }
+function makeDirNode(name, path, depth) {
+  return {
+    name,
+    path,
+    kind: 'dir',
+    depth,
+    fileCount: 0,
+    hasCode: false,
+    ext: [],
+    children: [],
+    truncated: false,
   }
-  budget.limit -= count
-  const sorted = [...ext.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
-  let codeCount = 0
-  for (const [name, n] of ext) if (CODE_EXT.has(name)) codeCount += n
-  return { count, ext: sorted, hasCode: codeCount > 0 }
 }
 
-/** 列出直接子文件（用于卡片里的"里面有什么"）。 */
-async function childFiles(abs, limit = 6) {
+/** 文件夹在前，组内按名称。 */
+function byKindThenName(a, b) {
+  if (a.kind !== b.kind) return a.kind === 'dir' ? -1 : 1
+  return collator.compare(a.name, b.name)
+}
+
+function topExt(map, n) {
+  return [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, n)
+}
+
+/**
+ * 一次递归：边列目录边建节点，文件数在回溯时累加。
+ * budget 是全局的，耗尽后只标记 truncated，不再往下展开。
+ */
+async function walkDir(abs, node, budget) {
   const entries = await listDir(abs)
-  return entries
-    .filter((e) => e.isFile() && !SKIP_FILES.has(e.name) && !e.name.startsWith('.'))
-    .slice(0, limit)
-    .map((e) => e.name)
+  const dirNames = []
+  const fileNames = []
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue
+      dirNames.push(entry.name)
+    } else if (entry.isFile()) {
+      if (SKIP_FILES.has(entry.name)) continue
+      fileNames.push(entry.name)
+    }
+  }
+  dirNames.sort(collator.compare)
+  fileNames.sort(collator.compare)
+
+  const ext = new Map()
+  let count = 0
+  let hasCode = false
+  for (const name of fileNames) {
+    const e = extname(name).toLowerCase() || '(无扩展名)'
+    ext.set(e, (ext.get(e) ?? 0) + 1)
+    budget.ext.set(e, (budget.ext.get(e) ?? 0) + 1)
+    if (CODE_EXT.has(e)) hasCode = true
+    count += 1
+  }
+
+  for (const name of dirNames) {
+    if (budget.nodes <= 0) {
+      budget.truncated = true
+      break
+    }
+    const child = makeDirNode(name, joinPath(node.path, name), node.depth + 1)
+    budget.nodes -= 1
+    budget.dirs += 1
+    node.children.push(child)
+    if (child.depth < MAX_DEPTH) {
+      const sub = await walkDir(join(abs, name), child, budget)
+      count += sub.count
+      if (sub.hasCode) hasCode = true
+      for (const [k, v] of sub.ext) ext.set(k, (ext.get(k) ?? 0) + v)
+    } else {
+      child.truncated = true
+    }
+  }
+
+  const shown = fileNames.slice(0, MAX_FILES_LIST)
+  if (shown.length < fileNames.length) node.truncated = true
+  for (const name of shown) {
+    if (budget.nodes <= 0) {
+      budget.truncated = true
+      break
+    }
+    const e = extname(name).toLowerCase()
+    budget.nodes -= 1
+    node.children.push({
+      name,
+      path: joinPath(node.path, name),
+      kind: 'file',
+      depth: node.depth + 1,
+      fileCount: 1,
+      hasCode: CODE_EXT.has(e),
+      ext: [[e || '(无扩展名)', 1]],
+      children: [],
+      truncated: false,
+    })
+  }
+
+  node.children.sort(byKindThenName)
+  node.fileCount = count
+  node.hasCode = hasCode
+  node.ext = topExt(ext, 3)
+  return { count, hasCode, ext }
+}
+
+/**
+ * 扫整棵树。force=true 时忽略缓存（「重新读一遍结构」）。
+ * 返回 { ok, root, name, tree, stats } 或 { ok:false, error }。
+ */
+async function scanTree(rootPath, force) {
+  const rootAbs = resolve(rootPath)
+  const info = await stat(rootAbs).catch(() => null)
+  if (!info || !info.isDirectory()) return { ok: false, error: '这不是一个能打开的文件夹' }
+
+  const hit = treeCache.get(rootAbs)
+  if (!force && hit && Date.now() - hit.at < TREE_TTL) return hit.payload
+
+  const name = info.name || rootAbs.split(sep).filter(Boolean).pop() || 'project'
+  const root = makeDirNode(name, '', 0)
+  const budget = { nodes: MAX_NODES_TREE - 1, dirs: 0, truncated: false, ext: new Map() }
+  await walkDir(rootAbs, root, budget)
+
+  const payload = {
+    ok: true,
+    root: slash(rootAbs),
+    name,
+    tree: root,
+    stats: {
+      files: root.fileCount,
+      dirs: budget.dirs,
+      truncated: budget.truncated,
+      languages: topExt(budget.ext, 8),
+      entries: root.children
+        .filter((child) => child.kind === 'file' && ENTRY_FILES.test(child.name))
+        .slice(0, 5)
+        .map((child) => child.path),
+      biggest: root.children
+        .filter((child) => child.kind === 'dir')
+        .slice()
+        .sort((a, b) => b.fileCount - a.fileCount)
+        .slice(0, 5)
+        .map((child) => ({ name: child.name, path: child.path, fileCount: child.fileCount })),
+    },
+  }
+  treeCache.set(rootAbs, { at: Date.now(), payload })
+  return payload
+}
+
+/** rel 为空表示根；越界返回 null。用分隔符判断，避免 /proj 命中 /proj-secret。 */
+function insidePath(rootAbs, rel) {
+  const abs = resolve(rootAbs, String(rel ?? ''))
+  if (abs === rootAbs) return abs
+  const base = rootAbs.endsWith(sep) ? rootAbs : rootAbs + sep
+  return abs.startsWith(base) ? abs : null
+}
+
+/** 按路径在树里找节点。 */
+function findNode(root, rel) {
+  if (!rel) return root
+  const parts = String(rel).replace(/\\/g, '/').split('/').filter(Boolean)
+  let node = root
+  for (const part of parts) {
+    const next = node.children.find((child) => child.name === part)
+    if (!next) return null
+    node = next
+  }
+  return node
+}
+
+/** 树里所有目录路径，用于把 import 归到最近的目录。 */
+function collectDirPaths(root, out = []) {
+  if (root.kind === 'dir' && root.path !== '') out.push(root.path)
+  for (const child of root.children) {
+    if (child.kind === 'dir') collectDirPaths(child, out)
+  }
+  return out
 }
 
 /** 读一个目录下的代码文件，抽出内部相对引用（只认 ./ 与 ../）。 */
@@ -131,7 +278,7 @@ async function collectImports(rootAbs, relDir, fileNames) {
       "|^\\s*import\\s*['\"]([^'\"\\n]+)['\"]",
     'gm',
   )
-  const limited = fileNames.filter(isCode).slice(0, 30)
+  const limited = fileNames.filter(isCode).slice(0, MAX_REF_FILES)
   for (const fileName of limited) {
     let text
     try {
@@ -145,7 +292,6 @@ async function collectImports(rootAbs, relDir, fileNames) {
     while ((m = pattern.exec(text)) !== null) {
       const spec = m[1] ?? m[2] ?? m[3] ?? m[4]
       if (!spec || !(spec.startsWith('./') || spec.startsWith('../'))) continue
-      // 归一化成相对项目根的路径，去掉扩展名
       const parts = slash(join(relDir, spec)).split('/')
       const stack = []
       for (const part of parts) {
@@ -171,126 +317,15 @@ function ownerOf(spec, knownDirs) {
   return best
 }
 
-async function scanProject(rootPath) {
-  const rootAbs = resolve(rootPath)
-  const budget = { limit: MAX_WALK }
-  const top = await listDir(rootAbs)
-  const ignored = []
-
-  const topDirs = []
-  const topFiles = []
-  for (const entry of top) {
-    if (entry.isDirectory()) {
-      if (SKIP_DIRS.has(entry.name)) ignored.push(entry.name + '/')
-      else if (!entry.name.startsWith('.')) topDirs.push(entry.name)
-      continue
-    }
-    if (!entry.isFile() || entry.name.startsWith('.')) continue
-    // 根目录的散文件：只有像入口的才进结构，其余归到「你不用管」
-    if (ENTRY_FILES.test(entry.name)) topFiles.push(entry.name)
-    else ignored.push(entry.name)
-  }
-
-  const nodes = []
-  const knownDirs = []
-
-  for (const dirName of topDirs) {
-    const abs = join(rootAbs, dirName)
-    const measured = await measure(abs, budget)
-    const files = await childFiles(abs)
-    const node = {
-      id: dirName,
-      name: dirName,
-      path: dirName,
-      kind: 'dir',
-      depth: 0,
-      fileCount: Math.max(measured.count, files.length),
-      ext: measured.ext,
-      hasCode: measured.hasCode,
-      files,
-      children: [],
-    }
-    nodes.push(node)
-    knownDirs.push(dirName)
-
-    // 只给「装代码的目录」展开一层，避免把 40 个文件夹全铺开
-    const sourceLike = /^(src|app|apps|packages|lib|components|server|api|source|platforms)$/i.test(dirName) || measured.hasCode
-    if (sourceLike && nodes.length < MAX_NODES) {
-      const subEntries = await listDir(abs)
-      const subs = subEntries
-        .filter((e) => e.isDirectory() && !SKIP_DIRS.has(e.name) && !e.name.startsWith('.'))
-        .slice(0, 8)
-      for (const sub of subs) {
-        if (nodes.length >= MAX_NODES) break
-        const subAbs = join(abs, sub.name)
-        const subMeasured = await measure(subAbs, budget)
-        const subFiles = await childFiles(subAbs)
-        const child = {
-          id: `${dirName}/${sub.name}`,
-          name: sub.name,
-          path: `${dirName}/${sub.name}`,
-          kind: 'dir',
-          depth: 1,
-          fileCount: Math.max(subMeasured.count, subFiles.length),
-          ext: subMeasured.ext,
-          hasCode: subMeasured.hasCode,
-          files: subFiles,
-          children: [],
-        }
-        node.children.push(child)
-        nodes.push(child)
-        knownDirs.push(child.id)
-      }
-    }
-  }
-
-  for (const fileName of topFiles.slice(0, 3)) {
-    nodes.push({
-      id: fileName,
-      name: fileName,
-      path: fileName,
-      kind: 'file',
-      depth: 0,
-      fileCount: 1,
-      ext: [[extname(fileName).toLowerCase(), 1]],
-      hasCode: isCode(fileName),
-      files: [fileName],
-      children: [],
-    })
-  }
-
-  // 引用关系：谁用了谁
-  const edges = new Map()
-  for (const node of nodes) {
-    if (node.kind !== 'dir') continue
-    const imports = await collectImports(rootAbs, node.path, node.files.length > 0 ? node.files : [])
-    const targets = new Set()
-    for (const spec of imports) {
-      const owner = ownerOf(spec, knownDirs)
-      if (owner && owner !== node.id) targets.add(owner)
-    }
-    edges.set(node.id, [...targets])
-  }
-  for (const node of nodes) {
-    node.imports = edges.get(node.id) ?? []
-    node.importedBy = nodes.filter((n) => n.id !== node.id && (n.imports ?? []).includes(node.id)).map((n) => n.id)
-  }
-
-  const stats = nodes.reduce(
-    (acc, n) => {
-      acc.files += n.depth === 0 ? n.fileCount : 0
-      return acc
-    },
-    { files: 0 },
-  )
-
-  return {
-    root: slash(rootAbs),
-    name: rootAbs.split(sep).filter(Boolean).pop() ?? 'project',
-    nodes,
-    ignored: [...new Set(ignored)].slice(0, 8),
-    stats: { files: stats.files, areas: nodes.filter((n) => n.depth === 0).length },
-  }
+/** 点开一个文件夹时才算引用关系；被谁引用需要全项目索引，本版不做。 */
+async function refsFor(rootAbs, node, tree) {
+  if (node.kind !== 'dir') return { imports: [], importedBy: [] }
+  const files = node.children.filter((child) => child.kind === 'file' && child.hasCode).map((child) => child.name)
+  if (files.length === 0) return { imports: [], importedBy: [] }
+  const specs = await collectImports(rootAbs, node.path, files)
+  const dirs = collectDirPaths(tree)
+  const imports = [...new Set([...specs].map((spec) => ownerOf(spec, dirs)).filter((dir) => dir && dir !== node.path))]
+  return { imports: imports.slice(0, 8), importedBy: [] }
 }
 
 /* ───────────────────── 人话层：本地词典 ─────────────────────
@@ -608,57 +643,6 @@ const SYSTEM = [
   '6. 只输出 JSON，不要 Markdown 代码块，不要解释。',
 ].join('\n')
 
-/** 给模型的节点上限：太多会把输出截断。 */
-const PROMPT_NODES = 12
-
-function buildPrompt(scan, compact, limit) {
-  const cap = Math.max(4, Math.min(compact ? 6 : limit || PROMPT_NODES, 26))
-  const top = scan.nodes.filter((node) => node.depth === 0)
-  const kids = scan.nodes.filter((node) => node.depth === 1).sort((a, b) => b.fileCount - a.fileCount)
-  const picked = top.slice(0, limit)
-  for (const kid of kids) {
-    if (picked.length >= limit) break
-    picked.push(kid)
-  }
-  const wanted = new Set(picked.map((node) => node.path))
-  const chosen = scan.nodes.filter((node) => wanted.has(node.path))
-
-  const lines = []
-  lines.push(`项目目录：${scan.root}`)
-  lines.push(`一共约 ${scan.stats.files} 个文件，下面列出其中值得讲的 ${chosen.length} 块。`)
-  lines.push('结构（缩进表示子块）：')
-  for (const node of chosen) {
-    const indent = node.depth === 1 ? '  ' : ''
-    const who = node.importedBy.length > 0 ? `；被 ${node.importedBy.slice(0, 3).join('、')} 使用` : ''
-    const uses = node.imports.length > 0 ? `；引用了 ${node.imports.slice(0, 3).join('、')}` : ''
-    lines.push(`${indent}- ${node.path}${who}${uses}`)
-    if (node.files.length > 0) lines.push(`${indent}  里面：${node.files.slice(0, 6).join('、')}`)
-  }
-
-  return [
-    lines.join('\n'),
-    '',
-    '输出这个 JSON（areas 放最前面，别的内容可以后写）：',
-    '{',
-    '  "areas": [{"path": "上面某一行的路径", "title": "不超过 6 字", "say": "一句人话", "metaphor": "一个比方", "effect": "改了会怎样", "safety": "safe|careful|risky"}],',
-    '  "summary": ["这个项目是干什么的", "现在能做什么", "还没做什么 / 有什么限制"],',
-    '  "firstLook": [{"file": "相对路径", "why": "为什么先看它"}],',
-    '  "ignore": [{"name": "文件名或文件夹名", "why": "为什么不用管"}]',
-    '}',
-    '',
-    '要求：',
-    `- areas 必须覆盖上面列出的每一个路径，一个不漏，顺序照抄，path 要一字不差。`,
-    '- areas 要最先写完，免得后面写太长被截断。',
-    '- title 说角色不说名字（例：「记账的规矩」而不是「store」）。',
-    '- say 不超过 40 字，讲它在系统里干什么。',
-    '- metaphor 是一句生活化的比方；想不出就给空字符串。',
-    '- effect 讲改了之后的后果，尽量说症状（例：「页面会白屏」「数据会丢」）。',
-    '- safety 只有 safe / careful / risky 三种：safe=放心改，careful=要小心，risky=别乱碰。',
-    '- firstLook 的 file 必须是上面出现过的路径或其中某个文件名。',
-    '- 只输出 JSON。',
-  ].join('\n')
-}
-
 /** 模型偶尔会把 JSON 说断（截断、多余逗号）。尽量抢救，救不回来才算失败。 */
 function closeBrackets(text) {
   const stack = []
@@ -749,238 +733,6 @@ async function callModel(ctx, prompt, signal, system) {
   }
 }
 
-/* ───────────────────────── 组装最终地图 ───────────────────────── */
-
-/** 取第一句话并压到一行，用来做副标题。 */
-function firstClause(text, max) {
-  const clean = String(text ?? '').replace(/\s+/g, ' ').trim()
-  if (clean === '') return ''
-  const cut = clean.search(/[。！？；!?;]/)
-  let head = cut > 0 ? clean.slice(0, cut) : clean
-  if (head.length > max) head = head.slice(0, max) + '…'
-  return head
-}
-
-function mergeNarration(scan, narration) {
-  // 模型写路径时常带 ./ 或末尾斜杠，这里统一归一化后再对号
-  const normPath = (value) =>
-    String(value ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '').toLowerCase()
-
-  const areas = new Map()
-  const rawAreas = narration ? narration.areas : null
-  if (Array.isArray(rawAreas)) {
-    for (const area of rawAreas) {
-      if (area && typeof area.path === 'string') areas.set(normPath(area.path), area)
-    }
-  } else if (rawAreas && typeof rawAreas === 'object') {
-    for (const [path, area] of Object.entries(rawAreas)) {
-      if (area && typeof area === 'object') areas.set(normPath(path), area)
-    }
-  }
-  // 兼容旧格式：单独的 safety 映射
-  const safety = narration && typeof narration.safety === 'object' && narration.safety ? narration.safety : {}
-
-  for (const node of scan.nodes) {
-    const heuristic = heuristicFor(node)
-    const area = areas.get(normPath(node.path))
-    const safetyTag = area?.safety ?? safety[node.path]
-    const modelSay = typeof area?.say === 'string' && area.say.trim() !== '' ? area.say.trim() : ''
-    const modelMetaphor = typeof area?.metaphor === 'string' && area.metaphor.trim() !== '' ? area.metaphor.trim() : ''
-    node.title = typeof area?.title === 'string' && area.title.trim() !== '' ? area.title.trim() : heuristic.title
-    // 常见文件夹名用词典里那句短的；模型补的块用模型自己那句，截到一句话
-    node.oneLine = heuristic.source === 'heuristic' ? heuristic.oneLine : firstClause(modelSay, 26) || heuristic.oneLine
-    node.plain = {
-      lead: modelSay || heuristic.plain.lead,
-      say: modelMetaphor ? '打比方：' + modelMetaphor : heuristic.plain.say,
-      effect: typeof area?.effect === 'string' && area.effect.trim() !== '' ? area.effect.trim() : heuristic.plain.effect,
-      safety: safetyTag === 'safe' || safetyTag === 'careful' || safetyTag === 'risky' ? safetyTag : heuristic.safety,
-    }
-    node.safety = node.plain.safety
-    node.related = [...(node.importedBy ?? []), ...(node.imports ?? [])].slice(0, 6)
-    node.deeper = deeperFor(node)
-  }
-
-  return {
-    root: scan.root,
-    name: scan.name,
-    generatedAt: Date.now(),
-    stats: scan.stats,
-    nodes: scan.nodes.filter((node) => node.depth === 0),
-    ignored: scan.ignored,
-    summary: narration && Array.isArray(narration.summary) && narration.summary.length > 0
-      ? narration.summary.slice(0, 3).map((s) => String(s).trim()).filter(Boolean)
-      : fallbackSummary(scan),
-    route: narration && Array.isArray(narration.firstLook) && narration.firstLook.length > 0
-      ? narration.firstLook
-          .filter((r) => r && typeof r.file === 'string')
-          .slice(0, 3)
-          .map((r) => ({ file: r.file, why: String(r.why ?? '').trim() || '先看它怎么跑起来的。' }))
-      : fallbackRoute(scan),
-    ignore: narration && Array.isArray(narration.ignore) && narration.ignore.length > 0
-      ? narration.ignore
-          .filter((r) => r && typeof r.name === 'string')
-          .slice(0, 5)
-          .map((r) => ({ name: r.name, why: String(r.why ?? '').trim() }))
-      : scan.ignored.slice(0, 5).map((n) => ({ name: n, why: '给工具看的，不是给你看的。' })),
-    narrated: Boolean(narration),
-  }
-}
-
-function deeperFor(node) {
-  const read = (node.files ?? []).find((f) => isCode(f)) ?? (node.files ?? [])[0] ?? node.name
-  return {
-    search: `「${node.title}」在项目里一般负责什么`,
-    read: node.kind === 'file' ? node.path : `${node.path}/${read}`,
-    ask: `「${node.path}」这块改之前我应该注意什么？`,
-  }
-}
-
-function fallbackSummary(scan) {
-  const top = scan.nodes.filter((n) => n.depth === 0 && n.kind === 'dir').slice(0, 3).map((n) => n.name)
-  return [
-    `这是一个叫 ${scan.name} 的项目，下面有 ${scan.stats.areas} 块、约 ${scan.stats.files} 个文件。`,
-    top.length > 0 ? `主要的部分是：${top.join('、')}。` : '暂时只读到了很少的文件。',
-    '模型还没给出完整解释，下面的内容是从目录和引用关系里直接读出来的。',
-  ]
-}
-
-function fallbackRoute(scan) {
-  const picks = []
-  for (const node of scan.nodes) {
-    const files = node.files ?? []
-    const entry = files.find((f) => ENTRY_FILES.test(f))
-    if (!entry) continue
-    picks.push({
-      file: node.kind === 'file' ? node.path : `${node.path}/${entry}`,
-      why: '这是启动的地方：程序从这里开始跑，顺着它能找到后面的一切。',
-    })
-    if (picks.length >= 3) break
-  }
-  if (picks.length === 0) {
-    for (const node of scan.nodes) {
-      const file = (node.files ?? []).find(isCode)
-      if (!file) continue
-      picks.push({
-        file: node.kind === 'file' ? node.path : `${node.path}/${file}`,
-        why: `这里有 ${node.fileCount} 个文件，先挑一个短的看，比从头读整个项目省力。`,
-      })
-      if (picks.length >= 3) break
-    }
-  }
-  return picks
-}
-
-/* ───────────────────────── 生成流程 ───────────────────────── */
-
-async function run(entry, ctx) {
-  try {
-    entry.phase = '读目录'
-    const scan = await scanProject(entry.path)
-
-    entry.phase = '看引用关系'
-    let narration = null
-    let note = null
-
-    if (entry.useModel) {
-      entry.phase = '写人话'
-      // 第一次给完整结构；如果模型把 JSON 说断了，就退成只讲顶层再试一次
-      for (const compact of [false, true]) {
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), 90000)
-        try {
-          const result = await callModel(ctx, buildPrompt(scan, compact, entry.limit), controller.signal)
-          if (result.error) {
-            note = result.error
-            if (result.retryable === false) break
-            continue
-          }
-          narration = parseJsonLoose(result.text)
-          if (narration !== null) {
-            note = null
-            break
-          }
-          note = '模型这次没把 JSON 说完整，只恢复了能救回来的部分'
-        } finally {
-          clearTimeout(timer)
-        }
-      }
-    } else {
-      note = '这次没有用模型，只读结构'
-    }
-
-    entry.map = mergeNarration(scan, narration)
-    entry.note = note
-    entry.status = 'ready'
-    entry.phase = 'done'
-    entry.finishedAt = Date.now()
-  } catch (error) {
-    entry.status = 'error'
-    entry.error = error instanceof Error ? error.message : String(error)
-    entry.phase = 'error'
-  } finally {
-    inFlight.delete(entry.cacheKey)
-  }
-}
-
-function ensure(ctx, path, options) {
-  const useModel = options?.useModel !== false
-  const limit = Math.max(4, Math.min(Number(options?.limit) || PROMPT_NODES, 26))
-  const key = `${resolve(path)}|${useModel ? 'm' : 'fact'}|${limit}`
-  const existing = cache.get(key)
-  if (existing && existing.status === 'scanning') return existing
-  if (existing && existing.status === 'ready' && !options?.force) return existing
-  const entry = {
-    status: 'scanning',
-    phase: '排队',
-    startedAt: Date.now(),
-    map: null,
-    error: null,
-    note: null,
-    useModel,
-    limit,
-    path: resolve(path),
-    cacheKey: key,
-  }
-  cache.set(key, entry)
-  inFlight.add(key)
-  void run(entry, ctx)
-  return entry
-}
-
-/* ───────────────────────── 路由 ───────────────────────── */
-
-function projectList(ctx) {
-  const registry = ctx.get('workspaceRegistry')
-  const projects = []
-  try {
-    for (const workspace of registry?.list?.() ?? []) {
-      const path = workspace?.path ?? workspace?.directory ?? workspace?.root
-      if (typeof path === 'string' && path.length > 0) {
-        projects.push({ id: String(workspace.id ?? path), title: String(workspace.title ?? workspace.name ?? path), path })
-      }
-    }
-  } catch {
-    /* 注册表不可用就退回默认目录 */
-  }
-
-  let defaultPath = projects.length > 0 ? projects[0].path : null
-  if (!defaultPath) {
-    try {
-      defaultPath = ctx.get('workingDirectory')?.defaultDirectory ?? null
-    } catch {
-      defaultPath = null
-    }
-  }
-  if (!defaultPath) {
-    try {
-      defaultPath = process.cwd()
-    } catch {
-      defaultPath = null
-    }
-  }
-  return { projects, defaultPath, cached: [...cache.keys()] }
-}
-
 /* ───────────────────── 代码层：单个文件 ───────────────────── */
 
 const FILE_SYSTEM = [
@@ -992,10 +744,6 @@ const FILE_SYSTEM = [
   '4. 不确定就说不确定，不要编造它没做过的事。',
   '5. 只输出 JSON。',
 ].join('\n')
-
-const MAX_FILE_BYTES = 400 * 1024
-const CODE_EXCERPT_LINES = 140
-const fileCache = new Map()
 
 /** 从源码里抽事实：行数、开头注释、依赖、导出的名字。 */
 function analyzeSource(text) {
@@ -1049,69 +797,287 @@ function buildFilePrompt(rel, info) {
   return bits.join('\n')
 }
 
-async function explainFile(ctx, rootPath, rel, useModel) {
-  const rootAbs = resolve(rootPath)
-  const abs = resolve(rootAbs, rel)
-  if (!abs.toLowerCase().startsWith(rootAbs.toLowerCase())) return { ok: false, error: '路径越界，拒绝读取' }
 
+/* ───────────────────────── 事实与精简文案 ───────────────────────── */
+
+/** 「去哪里接着看」的三条线索。 */
+function deeperFor(node) {
+  const read = (node.children ?? []).find((child) => child.kind === 'file' && isCode(child.name))
+  return {
+    search: `「${node.name}」在项目里一般负责什么`,
+    read: node.path === '' ? node.name : node.path,
+    ask: `「${node.path || node.name}」这块改之前我应该注意什么？`,
+    file: read ? read.path : null,
+  }
+}
+
+/**
+ * 点开节点时拿事实。文件夹只读树（零 IO），文件才读内容。
+ * 返回直接给浏览器的精简结构，不含模型输出。
+ */
+async function nodeFacts(rootAbs, rel, options) {
+  const abs = insidePath(rootAbs, rel)
+  if (!abs) return { ok: false, error: '路径越界，拒绝读取' }
   const info = await stat(abs).catch(() => null)
-  if (!info || !info.isFile()) return { ok: false, error: '这个文件不在了' }
+  if (!info) return { ok: false, error: '这个位置不在了' }
 
-  const key = `${abs}|${info.mtimeMs}|${useModel ? 'm' : 'f'}`
-  const cached = fileCache.get(key)
-  if (cached) return cached
+  const tree = await scanTree(rootAbs)
+  if (!tree.ok) return tree
+  const node = findNode(tree.tree, rel)
+  if (!node) return { ok: false, error: '树里找不到这个位置' }
+
+  const heuristic = heuristicFor(node)
+  const summary = {
+    title: heuristic.title,
+    oneLine: heuristic.oneLine,
+    say: heuristic.plain.lead,
+    effect: heuristic.plain.effect,
+    safety: heuristic.safety,
+    source: heuristic.source,
+  }
+  const deeper = deeperFor(node)
+
+  if (info.isDirectory()) {
+    const refs = options?.refs ? await refsFor(rootAbs, node, tree.tree) : null
+    return {
+      ok: true,
+      kind: 'dir',
+      path: node.path,
+      name: node.name,
+      fileCount: node.fileCount,
+      hasCode: node.hasCode,
+      ext: node.ext,
+      truncated: Boolean(node.truncated),
+      children: node.children.map((child) => ({
+        name: child.name,
+        path: child.path,
+        kind: child.kind,
+        fileCount: child.fileCount,
+        hasCode: child.hasCode,
+      })),
+      summary,
+      deeper,
+      refs,
+    }
+  }
 
   if (info.size > MAX_FILE_BYTES) return { ok: false, error: '文件太大（超过 400KB），先不读' }
-
   const text = await readFile(abs, 'utf8').catch(() => '')
   if (text === '') return { ok: false, error: '读不出这个文件（可能是图片或二进制）' }
   const facts = analyzeSource(text)
-
-  const base = {
+  const payload = {
     ok: true,
-    rel,
+    kind: 'file',
+    path: node.path,
+    name: node.name,
     lines: facts.lines,
+    bytes: facts.bytes,
+    comment: facts.comment,
     names: facts.names,
     imports: facts.imports,
     exports: facts.exports,
-    excerpt: facts.excerpt.split('\n').slice(0, 40).join('\n'),
-    narrated: false,
-    card: null,
-    note: null,
+    summary,
+    deeper,
+  }
+  if (options?.excerpt) payload.excerpt = facts.excerpt.split('\n').slice(0, 40).join('\n')
+  return payload
+}
+
+/* ───────────────────── 详细解释：点按钮才调模型 ───────────────────── */
+
+const FOLDER_SYSTEM = [
+  '你在给一个完全不懂编程的人解释项目里的一个文件夹。',
+  '规则：',
+  '1. 不出现术语缩写；必须用到的词，后面跟一句解释。',
+  '2. 说这个文件夹在项目里扮演什么角色，不要逐个罗列文件名。',
+  '3. 说「改了会怎样」，而不是只说「负责什么」：读者关心的是敢不敢动。',
+  '4. 打比方要具体、生活化，不要用「就像一个模块」这种同义反复。',
+  '5. 不确定就说不确定，不要编造框架名、服务名。',
+  '6. 只输出 JSON，不要 Markdown 代码块。',
+].join('\n')
+
+function buildFolderPrompt(node, isRoot) {
+  const dirs = node.children.filter((child) => child.kind === 'dir')
+  const files = node.children.filter((child) => child.kind === 'file')
+  const lines = []
+  lines.push(isRoot ? `这是一个项目，名叫 ${node.name}。` : `文件夹：${node.path}`)
+  lines.push(`里面共 ${node.fileCount} 个文件、${dirs.length} 个子文件夹。`)
+  if (dirs.length > 0) lines.push(`子文件夹：${dirs.slice(0, 12).map((child) => child.name).join('、')}`)
+  if (files.length > 0) lines.push(`直接包含的文件：${files.slice(0, 20).map((child) => child.name).join('、')}`)
+  const ext = (node.ext ?? []).map(([name, count]) => `${name}×${count}`).join(' ')
+  if (ext !== '') lines.push(`文件类型：${ext}`)
+  lines.push(
+    '',
+    '输出 JSON：',
+    '{',
+    '  "title": "不超过 8 字，说它的角色",',
+    '  "gist": "一句话：它在整个项目里扮演什么角色",',
+    '  "does": "2~3 句：里面的东西合起来做了什么，按发生顺序说",',
+    '  "risk": "改了它，会看到什么症状",',
+    '  "safety": "safe|careful|risky"',
+    '}',
+    '只输出 JSON。',
+  )
+  return lines.join('\n')
+}
+
+/**
+ * 生成「详细」解释。按文件 mtime / 目录 mtime+规模缓存；
+ * regen=true 时忽略缓存重新问一次。
+ */
+async function detailFor(ctx, rootAbs, rel, options) {
+  const abs = insidePath(rootAbs, rel)
+  if (!abs) return { ok: false, error: '路径越界，拒绝读取' }
+  const info = await stat(abs).catch(() => null)
+  if (!info) return { ok: false, error: '这个位置不在了' }
+
+  const tree = await scanTree(rootAbs)
+  if (!tree.ok) return tree
+  const node = findNode(tree.tree, rel)
+  if (!node) return { ok: false, error: '树里找不到这个位置' }
+
+  const isFile = info.isFile()
+  const sig = isFile ? String(info.mtimeMs) : `${info.mtimeMs}:${node.children.length}:${node.fileCount}`
+  const key = `${abs}|${isFile ? 'f' : 'd'}|${sig}`
+
+  if (!options?.regen) {
+    const hit = detailCache.get(key)
+    if (hit) return { ok: true, kind: isFile ? 'file' : 'dir', detail: hit, cached: true }
   }
 
-  if (!useModel) {
-    const result = { ...base, note: '这次没有用模型' }
-    fileCache.set(key, result)
-    return result
-  }
-
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 60000)
-  try {
-    const call = await callModel(ctx, buildFilePrompt(rel, facts), controller.signal, FILE_SYSTEM)
-    if (call.error) return { ...base, note: call.error }
-    const parsed = parseJsonLoose(call.text)
-    if (!parsed) return { ...base, note: '模型这次没把 JSON 说完整' }
-    const result = {
-      ...base,
-      narrated: true,
-      card: {
-        title: String(parsed.title ?? '').trim() || null,
+  if (isFile) {
+    if (info.size > MAX_FILE_BYTES) return { ok: false, error: '文件太大（超过 400KB），先不读' }
+    const text = await readFile(abs, 'utf8').catch(() => '')
+    if (text === '') return { ok: false, error: '读不出这个文件（可能是图片或二进制）' }
+    const facts = analyzeSource(text)
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 60000)
+    try {
+      const call = await callModel(ctx, buildFilePrompt(node.path, facts), controller.signal, FILE_SYSTEM)
+      if (call.error) return { ok: false, error: call.error }
+      const parsed = parseJsonLoose(call.text)
+      if (!parsed) return { ok: false, error: '模型这次没把 JSON 说完整，再点一次「重新生成」试试' }
+      const detail = {
+        title: String(parsed.title ?? '').trim() || node.name,
         gist: String(parsed.gist ?? '').trim(),
         does: String(parsed.does ?? '').trim(),
         takeIn: String(parsed.takeIn ?? '').trim(),
         giveOut: String(parsed.giveOut ?? '').trim(),
         risk: String(parsed.risk ?? '').trim(),
         safety: ['safe', 'careful', 'risky'].includes(parsed.safety) ? parsed.safety : 'careful',
-      },
+      }
+      detailCache.set(key, detail)
+      return { ok: true, kind: 'file', detail, cached: false }
+    } finally {
+      clearTimeout(timer)
     }
-    fileCache.set(key, result)
-    return result
+  }
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 90000)
+  try {
+    const call = await callModel(ctx, buildFolderPrompt(node, rel === ''), controller.signal, FOLDER_SYSTEM)
+    if (call.error) return { ok: false, error: call.error }
+    const parsed = parseJsonLoose(call.text)
+    if (!parsed) return { ok: false, error: '模型这次没把 JSON 说完整，再点一次「重新生成」试试' }
+    const detail = {
+      title: String(parsed.title ?? '').trim() || node.name,
+      gist: String(parsed.gist ?? '').trim(),
+      does: String(parsed.does ?? '').trim(),
+      risk: String(parsed.risk ?? '').trim(),
+      safety: ['safe', 'careful', 'risky'].includes(parsed.safety) ? parsed.safety : 'careful',
+    }
+    detailCache.set(key, detail)
+    return { ok: true, kind: 'dir', detail, cached: false }
   } finally {
     clearTimeout(timer)
   }
 }
+
+/* ─────────────── 旧版 /map 兼容层：过渡期让现有界面还能用 ─────────────── */
+
+function legacyNode(node) {
+  const heuristic = heuristicFor(node)
+  const files = node.children.filter((child) => child.kind === 'file')
+  const dirs = node.children.filter((child) => child.kind === 'dir')
+  return {
+    id: node.path,
+    name: node.name,
+    path: node.path,
+    kind: node.kind,
+    depth: Math.max(0, node.depth - 1),
+    fileCount: node.fileCount,
+    ext: node.ext,
+    hasCode: node.hasCode,
+    files: files.slice(0, 6).map((child) => child.name),
+    children: dirs.map(legacyNode),
+    imports: [],
+    importedBy: [],
+    title: heuristic.title,
+    oneLine: heuristic.oneLine,
+    plain: { lead: heuristic.plain.lead, say: heuristic.plain.say, effect: heuristic.plain.effect, safety: heuristic.safety },
+    safety: heuristic.safety,
+    related: [],
+    deeper: deeperFor(node),
+  }
+}
+
+function legacyMap(tree) {
+  const nodes = tree.tree.children.map(legacyNode)
+  const entries = tree.stats.entries
+  return {
+    root: tree.root,
+    name: tree.name,
+    generatedAt: Date.now(),
+    stats: { files: tree.stats.files, areas: nodes.length },
+    nodes,
+    ignored: [],
+    summary: [
+      `这是一个叫 ${tree.name} 的项目，下面有 ${tree.stats.dirs} 个文件夹、约 ${tree.stats.files} 个文件。`,
+      tree.stats.biggest.length > 0 ? `最大的几块是：${tree.stats.biggest.map((item) => item.name).join('、')}。` : '暂时只读到了很少的文件。',
+      '这一版只读结构，人话解释要点开某一块再问模型。',
+    ],
+    route: entries.map((file) => ({ file, why: '这是启动的地方：程序从这里开始跑。' })),
+    ignore: [],
+    narrated: false,
+  }
+}
+
+/* ───────────────────────── 项目列表 ───────────────────────── */
+
+function projectList(ctx) {
+  const registry = ctx.get('workspaceRegistry')
+  const projects = []
+  try {
+    for (const workspace of registry?.list?.() ?? []) {
+      const path = workspace?.path ?? workspace?.directory ?? workspace?.root
+      if (typeof path === 'string' && path.length > 0) {
+        projects.push({ id: String(workspace.id ?? path), title: String(workspace.title ?? workspace.name ?? path), path })
+      }
+    }
+  } catch {
+    /* 注册表不可用就退回默认目录 */
+  }
+
+  let defaultPath = projects.length > 0 ? projects[0].path : null
+  if (!defaultPath) {
+    try {
+      defaultPath = ctx.get('workingDirectory')?.defaultDirectory ?? null
+    } catch {
+      defaultPath = null
+    }
+  }
+  if (!defaultPath) {
+    try {
+      defaultPath = process.cwd()
+    } catch {
+      defaultPath = null
+    }
+  }
+  return { projects, defaultPath }
+}
+
+/* ───────────────────────── 路由 ───────────────────────── */
 
 export function apply(ctx) {
   const routes = [
@@ -1126,16 +1092,49 @@ export function apply(ctx) {
     },
     {
       kind: 'exact',
-      path: `${API}/map`,
+      path: `${API}/tree`,
       handler: (req, res) => {
         if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
         if (!requireSameOrigin(req, res)) return
         const url = new URL(req.url ?? '/', 'http://localhost')
         const requestPath = url.searchParams.get('path')
         if (!requestPath) return json(res, 400, { ok: false, error: 'missing-path' })
-        void handleMap(ctx, requestPath, false, url.searchParams).then((payload) => json(res, 200, payload)).catch((error) => {
-          json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
-        })
+        const force = url.searchParams.get('refresh') === '1'
+        void scanTree(requestPath, force)
+          .then((payload) => json(res, 200, payload))
+          .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
+      },
+    },
+    {
+      kind: 'exact',
+      path: `${API}/node`,
+      handler: (req, res) => {
+        if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+        if (!requireSameOrigin(req, res)) return
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const root = url.searchParams.get('path')
+        if (!root) return json(res, 400, { ok: false, error: 'missing-path' })
+        const rel = url.searchParams.get('rel') ?? ''
+        const refs = url.searchParams.get('refs') === '1'
+        void nodeFacts(resolve(root), rel, { refs })
+          .then((payload) => json(res, 200, payload))
+          .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
+      },
+    },
+    {
+      kind: 'exact',
+      path: `${API}/detail`,
+      handler: (req, res) => {
+        if (req.method !== 'GET' && req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+        if (!requireSameOrigin(req, res)) return
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const root = url.searchParams.get('path')
+        if (!root) return json(res, 400, { ok: false, error: 'missing-path' })
+        const rel = url.searchParams.get('rel') ?? ''
+        const regen = url.searchParams.get('regen') === '1'
+        void detailFor(ctx, resolve(root), rel, { regen })
+          .then((payload) => json(res, 200, payload))
+          .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
       },
     },
     {
@@ -1149,23 +1148,31 @@ export function apply(ctx) {
         const rel = url.searchParams.get('rel')
         if (!root || !rel) return json(res, 400, { ok: false, error: 'missing-path' })
         const useModel = url.searchParams.get('model') !== '0'
-        void explainFile(ctx, root, rel, useModel)
+        void (async () => {
+          const facts = await nodeFacts(resolve(root), rel, { excerpt: true })
+          if (!facts.ok) return { ok: false, error: facts.error }
+          if (!useModel) return { ...facts, rel, narrated: false, card: null, note: '这次没有用模型' }
+          const detailed = await detailFor(ctx, resolve(root), rel, {})
+          if (!detailed.ok) return { ...facts, rel, narrated: false, card: null, note: detailed.error }
+          return { ...facts, rel, narrated: true, card: detailed.detail, note: null }
+        })()
           .then((payload) => json(res, 200, payload))
           .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
       },
     },
     {
       kind: 'exact',
-      path: `${API}/refresh`,
+      path: `${API}/map`,
       handler: (req, res) => {
-        if (req.method !== 'GET' && req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+        if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
         if (!requireSameOrigin(req, res)) return
         const url = new URL(req.url ?? '/', 'http://localhost')
         const requestPath = url.searchParams.get('path')
         if (!requestPath) return json(res, 400, { ok: false, error: 'missing-path' })
-        void handleMap(ctx, requestPath, true, url.searchParams).then((payload) => json(res, 200, payload)).catch((error) => {
-          json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
-        })
+        const force = url.searchParams.get('refresh') === '1'
+        void scanTree(requestPath, force)
+          .then((tree) => (tree.ok ? json(res, 200, { ok: true, status: 'ready', map: legacyMap(tree), note: null }) : json(res, 200, tree)))
+          .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
       },
     },
   ]
@@ -1182,27 +1189,4 @@ export function apply(ctx) {
       for (const dispose of disposers) dispose()
     }
   }, 'project-guide: routes')
-
-  // 不在启动时偷读：要不要花模型的钱由页面上的设置决定，用户点开才读。
-}
-
-async function handleMap(ctx, requestPath, force, params) {
-  const info = await stat(resolve(requestPath)).catch(() => null)
-  if (!info || !info.isDirectory()) {
-    return { ok: false, error: '这不是一个能打开的文件夹' }
-  }
-  const modelParam = params ? params.get('model') : null
-  const limitParam = params ? params.get('limit') : null
-  const entry = ensure(ctx, requestPath, {
-    force,
-    useModel: modelParam === null ? undefined : modelParam !== '0',
-    limit: limitParam === null ? undefined : Number(limitParam),
-  })
-  if (entry.status === 'error') {
-    return { ok: false, error: entry.error }
-  }
-  if (entry.status === 'ready') {
-    return { ok: true, status: 'ready', map: entry.map, note: entry.note }
-  }
-  return { ok: true, status: 'generating', phase: entry.phase, elapsed: Date.now() - entry.startedAt }
 }
