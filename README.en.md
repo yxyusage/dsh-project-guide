@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.2.0-5b8cff?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-0.2.1-5b8cff?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-3fb950?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/DSH-Desktop%20%2B%20Web-6b5cff?style=flat-square">
 </p>
@@ -53,6 +53,8 @@ Each detail card shows facts and judgment side by side. Risk has four states:
 **safe / careful / hands-off / not assessed**
 
 Without positive evidence the answer is "not assessed" — no defaulting to safe. Press **Assess all** to grade a whole level in one model call (a few seconds); those verdicts are marked as *assessed*.
+
+> Upgrading from 0.1? Both the API and the UI changed — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 

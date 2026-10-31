@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.2.0-5b8cff?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-0.2.1-5b8cff?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-3fb950?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/DSH-Desktop%20%2B%20Web-6b5cff?style=flat-square">
 </p>
@@ -53,6 +53,8 @@
 **放心改 / 要小心 / 别乱碰 / 未评估**
 
 没有正面证据时就是「未评估」——不会拿默认值假装安全。想一次给一整层定级，点右上角「评估全部」：一次模型调用，几秒钟，结果标「预判」。
+
+> 从 0.1 升级过来的话：接口和界面都变了，先看一眼 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 装上
 
