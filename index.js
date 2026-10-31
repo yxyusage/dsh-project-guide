@@ -584,6 +584,237 @@ const KNOW = {
     effect: '只影响检查结果，不影响产品。',
     safety: 'safe',
   },
+  routes: {
+    title: '地址对照表',
+    oneLine: '哪个网址交给哪段代码',
+    say: '这里列着「用户访问某个网址时，交给谁去处理」的对照关系。',
+    effect: '删掉一条，那个网址就没人接，访问会变成 404。',
+    safety: 'careful',
+  },
+  controllers: {
+    title: '接请求的柜台',
+    oneLine: '每种请求由谁来办',
+    say: '用户的每个动作先到这里，它负责检查要什么，然后叫后面的人干活。',
+    effect: '改错这里，功能会整个不响应，或者返回看不懂的错误。',
+    safety: 'careful',
+  },
+  models: {
+    title: '数据的形状',
+    oneLine: '一条数据长什么样',
+    say: '这里规定「一条数据」有哪些字段、什么类型。存和取都按这个形状来。',
+    effect: '改这里会同时影响存进去和读出来的地方，最容易一处改、多处坏。',
+    safety: 'risky',
+  },
+  services: {
+    title: '业务的做法',
+    oneLine: '一件事具体怎么办',
+    say: '把「怎么办一件事」的步骤集中放在这里，别的地方只负责调用。',
+    effect: '改这里会影响所有调用它的地方，但不会直接改变界面长相。',
+    safety: 'careful',
+  },
+  middleware: {
+    title: '进门前的关卡',
+    oneLine: '请求先过一遍检查',
+    say: '每个请求进来先经过这里，检查身份、记日志、挡掉不合规的。',
+    effect: '改错会影响所有请求：可能全部被拦下，也可能该拦的没拦住。',
+    safety: 'risky',
+  },
+  db: {
+    title: '存东西的地方',
+    oneLine: '真正落地保存数据',
+    say: '负责连接数据库、把数据写进去或者读出来。',
+    effect: '改错了最常见的是「界面没报错，但数据不显示」。',
+    safety: 'risky',
+  },
+  database: {
+    title: '存东西的地方',
+    oneLine: '真正落地保存数据',
+    say: '负责连接数据库、把数据写进去或者读出来。',
+    effect: '改错了最常见的是「界面没报错，但数据不显示」。',
+    safety: 'risky',
+  },
+  migrations: {
+    title: '改表的记录',
+    oneLine: '数据库结构的变更历史',
+    say: '每一次给数据表加字段、改类型，都留一条记录在这里，按顺序执行。',
+    effect: '顺序错了或者和线上不一致，就可能丢数据；这类改动要先备份。',
+    safety: 'risky',
+  },
+  schemas: {
+    title: '数据的规矩',
+    oneLine: '什么数据算合法',
+    say: '定义每个字段的类型和限制，进来出去都要先过这套规矩。',
+    effect: '放宽或收紧都会影响已有数据，老数据可能突然不合法。',
+    safety: 'careful',
+  },
+  handlers: {
+    title: '一件事的处理器',
+    oneLine: '收到通知后做什么',
+    say: '每种事情发生时会走这里，它在里面决定接下来做哪几步。',
+    effect: '改错会让某类事情悄悄不发生，界面上看不出来。',
+    safety: 'careful',
+  },
+  workers: {
+    title: '后台干活的',
+    oneLine: '不占界面的重活',
+    say: '有些活太慢，不能挡着用户，就交给这里的后台进程慢慢做。',
+    effect: '改错不会白屏，而是「点了没反应」或者数据一直不更新。',
+    safety: 'careful',
+  },
+  jobs: {
+    title: '排队要做的事',
+    oneLine: '一件件等着被处理',
+    say: '把要做的事排成队，由后台一件件取出来执行。',
+    effect: '改错可能让任务重复执行，或者排着队永远不动。',
+    safety: 'careful',
+  },
+  queue: {
+    title: '排队的地方',
+    oneLine: '任务先进先出',
+    say: '所有待办任务在这里排队，谁先来谁先被拿走。',
+    effect: '改错会丢任务或卡住整条流水线，属于要小心的一层。',
+    safety: 'risky',
+  },
+  events: {
+    title: '通知站',
+    oneLine: '事情发生后广播给别人',
+    say: '一件事做完后在这里喊一声，关心这件事的模块各自去做自己的部分。',
+    effect: '改错会让某些「顺带做的事」不做了，症状很隐蔽。',
+    safety: 'careful',
+  },
+  i18n: {
+    title: '界面语言对照',
+    oneLine: '同一句话的中英版本',
+    say: '界面上每句话都按名字存在这里，一份中文一份英文，切换语言就是换一份。',
+    effect: '漏一个词，界面上那个位置会显示成代号；改坏符号可能导致整份读不出来。',
+    safety: 'safe',
+  },
+  locales: {
+    title: '界面语言对照',
+    oneLine: '同一句话的中英版本',
+    say: '界面上每句话都按名字存在这里，一份中文一份英文，切换语言就是换一份。',
+    effect: '漏一个词，界面上那个位置会显示成代号；改坏符号可能导致整份读不出来。',
+    safety: 'safe',
+  },
+  templates: {
+    title: '填空的模板',
+    oneLine: '把变量填进固定格式',
+    say: '这里放着固定的版式，真正生成内容时把具体值填进空位。',
+    effect: '改错只会影响生成出来的样子，不会让程序跑不起来。',
+    safety: 'safe',
+  },
+  themes: {
+    title: '换皮肤的地方',
+    oneLine: '颜色和样式的一套套方案',
+    say: '每种主题是一套颜色和间距，换主题就是换这一套值。',
+    effect: '改错只影响长相，不影响功能。',
+    safety: 'safe',
+  },
+  plugins: {
+    title: '外挂',
+    oneLine: '可以插拔的扩展',
+    say: '核心之外的能力放在这里，加载时才接进来，可以按需开关。',
+    effect: '改错可能让某个扩展整体失效，主程序通常还能跑。',
+    safety: 'careful',
+  },
+  sdk: {
+    title: '给外部用的工具包',
+    oneLine: '别人接入你时用的那层',
+    say: '把内部能力包成一套对外的说法，外部只用这一层，不用关心里面怎么实现。',
+    effect: '改了对外说法，用它的外部程序可能跟着坏，属于要小心的接口。',
+    safety: 'careful',
+  },
+  integrations: {
+    title: '跟别人对接',
+    oneLine: '和外部服务打交道的代码',
+    say: '每个外部服务在这里有一份对接代码，负责地址、鉴权和格式转换。',
+    effect: '对方接口一变这里就得改；改错了症状通常是「数据不来」。',
+    safety: 'careful',
+  },
+  cli: {
+    title: '命令行入口',
+    oneLine: '在终端里敲的那条命令',
+    say: '从终端启动程序时先走这里：解析你敲的参数，再叫真正的逻辑。',
+    effect: '改错会让命令报错或者参数不认，但不影响别的方式启动。',
+    safety: 'careful',
+  },
+  infra: {
+    title: '上线的地基',
+    oneLine: '服务器和环境的定义',
+    say: '用代码描述线上要几台机器、什么配置、怎么连起来。',
+    effect: '改错可能让整套环境起不来；这类改动通常要走审批和演练。',
+    safety: 'risky',
+  },
+  deploy: {
+    title: '上线的步骤',
+    oneLine: '把新版本放上去的流程',
+    say: '把「怎么发布」写成步骤：打包、上传、重启、检查。',
+    effect: '改错可能导致发布中断或旧版本被覆盖，动手前先确认。',
+    safety: 'risky',
+  },
+  docker: {
+    title: '装进盒子的配方',
+    oneLine: '把项目打包成可搬运的容器',
+    say: '定义这个项目运行需要什么环境，打成一致的盒子，到哪里都一样跑。',
+    effect: '改错容器起不来，本地开发一般不受影响。',
+    safety: 'careful',
+  },
+  k8s: {
+    title: '集群调度',
+    oneLine: '一堆机器上怎么分配服务',
+    say: '告诉集群要跑几个副本、怎么扩缩容、挂了怎么重启。',
+    effect: '改错可能让服务起不来或流量分错，属于高风险改动。',
+    safety: 'risky',
+  },
+  ci: {
+    title: '自动检查',
+    oneLine: '每次提交后自动跑一遍',
+    say: '提交代码后自动装依赖、跑测试、做检查，不合格就拦下。',
+    effect: '改错可能让检查永远不通过，或者该拦的没拦住。',
+    safety: 'safe',
+  },
+  examples: {
+    title: '示例',
+    oneLine: '给人照着抄的用法',
+    say: '每个例子演示一种用法，通常可以独立运行。',
+    effect: '不参与主流程，改了不影响程序。',
+    safety: 'safe',
+  },
+  fixtures: {
+    title: '测试用的假数据',
+    oneLine: '测试里替代真实数据',
+    say: '测试时不碰真实数据，用这里准备好的固定样本，结果才可重复。',
+    effect: '改了可能让测试对不上而失败；不影响线上。',
+    safety: 'safe',
+  },
+  mocks: {
+    title: '替身',
+    oneLine: '测试里假装的外部服务',
+    say: '测试时不去真调外部服务，用这里的替身返回固定结果。',
+    effect: '替身和真实行为不一致时，测试会「假通过」。',
+    safety: 'safe',
+  },
+  e2e: {
+    title: '端到端测试',
+    oneLine: '像真人一样点一遍',
+    say: '用程序模拟真人操作，从打开界面一直点到结果出现。',
+    effect: '改错会误报或漏报，通常不影响线上功能。',
+    safety: 'safe',
+  },
+  stories: {
+    title: '组件展示页',
+    oneLine: '把零件一个个摆出来看',
+    say: '每个界面零件在这里单独展示，方便调样式、看各种状态。',
+    effect: '不参与正式运行，改了不影响产品。',
+    safety: 'safe',
+  },
+  dashboard: {
+    title: '看板',
+    oneLine: '一屏看完关键指标',
+    say: '把重要数字和图表集中摆在一屏，供人快速判断现状。',
+    effect: '改错通常只是显示不对，不动底层数据。',
+    safety: 'careful',
+  },
 }
 
 /** 根目录常见文件，单独给一句人话，避免「这是项目里的一个文件」这种废话。 */
@@ -595,6 +826,104 @@ const FILE_KNOW = {
   'contributing.md': { title: '怎么参与', oneLine: '给协作者看的开发规范', say: '告诉别人怎么提问题、怎么提交代码。不参与运行。', effect: '改了不影响程序。', safety: 'safe' },
   'index.html': { title: '网页的入口', oneLine: '浏览器打开就开始跑', say: '整个网站从这里启动，它把真正的程序加载进来。通常很短，基本不用改。', effect: '改错了会整页白屏，而且看不出错在哪。', safety: 'risky' },
   'dockerfile': { title: '打包成容器的配方', oneLine: '怎么把项目装进一个盒子', say: '一份说明书，告诉工具如何把项目打包成可以到处运行的容器。', effect: '改错了容器起不来；不影响本地开发。', safety: 'careful' },
+  'tsconfig.json': {
+    title: '编译设置',
+    oneLine: '代码怎么翻译成能跑的形式',
+    say: '规定代码的版本、严格程度、哪些文件参与编译。',
+    effect: '改严了会冒出一堆报错，改松了错误会漏到运行时。',
+    safety: 'careful',
+  },
+  'jsconfig.json': {
+    title: '编辑器设置',
+    oneLine: '让编辑器更懂这个项目',
+    say: '告诉编辑器去哪找代码、怎么理解路径别名。',
+    effect: '只影响编辑体验，不影响运行。',
+    safety: 'safe',
+  },
+  'vite.config.ts': {
+    title: '打包设置',
+    oneLine: '开发服务器和打包怎么跑',
+    say: '规定开发时怎么起服务、打包时怎么合并压缩、有哪些快捷路径。',
+    effect: '改错会让开发服务器起不来或打包失败。',
+    safety: 'careful',
+  },
+  'vite.config.js': {
+    title: '打包设置',
+    oneLine: '开发服务器和打包怎么跑',
+    say: '规定开发时怎么起服务、打包时怎么合并压缩、有哪些快捷路径。',
+    effect: '改错会让开发服务器起不来或打包失败。',
+    safety: 'careful',
+  },
+  'webpack.config.js': {
+    title: '打包设置',
+    oneLine: '把很多文件合成几个',
+    say: '规定从哪个文件开始、怎么合并、怎么处理各种类型的文件。',
+    effect: '改错会让打包失败，页面直接白屏。',
+    safety: 'careful',
+  },
+  'jest.config.js': {
+    title: '测试设置',
+    oneLine: '测试怎么跑、跑哪些',
+    say: '规定测试文件在哪、用什么环境跑、覆盖率怎么算。',
+    effect: '改错会导致测试一个都跑不起来，或漏跑一大片。',
+    safety: 'safe',
+  },
+  'vitest.config.ts': {
+    title: '测试设置',
+    oneLine: '测试怎么跑、跑哪些',
+    say: '规定测试文件在哪、用什么环境跑、覆盖率怎么算。',
+    effect: '改错会导致测试一个都跑不起来，或漏跑一大片。',
+    safety: 'safe',
+  },
+  'tailwind.config.js': {
+    title: '样式设置',
+    oneLine: '有哪些颜色和间距可用',
+    say: '定义可用的颜色、字号、间距，样式里只能用这里出现过的值。',
+    effect: '删掉一个值，用到它的地方会突然没样式。',
+    safety: 'safe',
+  },
+  'postcss.config.js': {
+    title: '样式处理',
+    oneLine: '样式文件先怎么加工',
+    say: '规定样式在交给浏览器之前要经过哪些加工步骤。',
+    effect: '改错会让样式整体失效，页面变成没有排版的纯文字。',
+    safety: 'careful',
+  },
+  'docker-compose.yml': {
+    title: '几个盒子的组合',
+    oneLine: '一次启动整套服务',
+    say: '把数据库、后端、前端这些盒子写成一份清单，一条命令全部起来。',
+    effect: '改错可能整套起不来，或者端口撞车。',
+    safety: 'careful',
+  },
+  makefile: {
+    title: '命令快捷方式',
+    oneLine: '把常用命令起个短名字',
+    say: '把一长串命令收成一个短名字，敲一下就跑完。',
+    effect: '改错会让对应命令失效，不影响程序本身。',
+    safety: 'careful',
+  },
+  'requirements.txt': {
+    title: '依赖清单',
+    oneLine: '要装哪些现成的库',
+    say: '列出这个项目依赖的库和版本，装环境时按这份清单来。',
+    effect: '改错版本会装不上，或者装上了跑不对。',
+    safety: 'careful',
+  },
+  'pyproject.toml': {
+    title: '项目说明与依赖',
+    oneLine: '名字、依赖、构建方式',
+    say: '把项目信息和依赖写在一处，工具按它来安装和打包。',
+    effect: '改错会导致装不上或打包失败。',
+    safety: 'careful',
+  },
+  'manifest.json': {
+    title: '应用说明',
+    oneLine: '叫什么、要什么权限',
+    say: '告诉宿主这个应用的名字、图标、需要哪些权限。',
+    effect: '改错可能导致应用装不上，或缺少权限而功能失效。',
+    safety: 'careful',
+  },
 }
 
 function heuristicFor(node) {
@@ -1019,55 +1348,6 @@ async function detailFor(ctx, rootAbs, rel, options) {
   }
 }
 
-/* ─────────────── 旧版 /map 兼容层：过渡期让现有界面还能用 ─────────────── */
-
-function legacyNode(node) {
-  const heuristic = heuristicFor(node)
-  const files = node.children.filter((child) => child.kind === 'file')
-  const dirs = node.children.filter((child) => child.kind === 'dir')
-  return {
-    id: node.path,
-    name: node.name,
-    path: node.path,
-    kind: node.kind,
-    depth: Math.max(0, node.depth - 1),
-    fileCount: node.fileCount,
-    ext: node.ext,
-    hasCode: node.hasCode,
-    files: files.slice(0, 6).map((child) => child.name),
-    children: dirs.map(legacyNode),
-    imports: [],
-    importedBy: [],
-    title: heuristic.title,
-    oneLine: heuristic.oneLine,
-    plain: { lead: heuristic.plain.lead, say: heuristic.plain.say, effect: heuristic.plain.effect, safety: heuristic.safety },
-    safety: heuristic.safety,
-    related: [],
-    deeper: deeperFor(node),
-  }
-}
-
-function legacyMap(tree) {
-  const nodes = tree.tree.children.map(legacyNode)
-  const entries = tree.stats.entries
-  return {
-    root: tree.root,
-    name: tree.name,
-    generatedAt: Date.now(),
-    stats: { files: tree.stats.files, areas: nodes.length },
-    nodes,
-    ignored: [],
-    summary: [
-      `这是一个叫 ${tree.name} 的项目，下面有 ${tree.stats.dirs} 个文件夹、约 ${tree.stats.files} 个文件。`,
-      tree.stats.biggest.length > 0 ? `最大的几块是：${tree.stats.biggest.map((item) => item.name).join('、')}。` : '暂时只读到了很少的文件。',
-      '这一版只读结构，人话解释要点开某一块再问模型。',
-    ],
-    route: entries.map((file) => ({ file, why: '这是启动的地方：程序从这里开始跑。' })),
-    ignore: [],
-    narrated: false,
-  }
-}
-
 /* ───────────────────────── 项目列表 ───────────────────────── */
 
 function projectList(ctx) {
@@ -1159,44 +1439,6 @@ export function apply(ctx) {
         const regen = url.searchParams.get('regen') === '1'
         void detailFor(ctx, resolve(root), rel, { regen })
           .then((payload) => json(res, 200, payload))
-          .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
-      },
-    },
-    {
-      kind: 'exact',
-      path: `${API}/file`,
-      handler: (req, res) => {
-        if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-        if (!requireSameOrigin(req, res)) return
-        const url = new URL(req.url ?? '/', 'http://localhost')
-        const root = url.searchParams.get('path')
-        const rel = url.searchParams.get('rel')
-        if (!root || !rel) return json(res, 400, { ok: false, error: 'missing-path' })
-        const useModel = url.searchParams.get('model') !== '0'
-        void (async () => {
-          const facts = await nodeFacts(resolve(root), rel, { excerpt: true })
-          if (!facts.ok) return { ok: false, error: facts.error }
-          if (!useModel) return { ...facts, rel, narrated: false, card: null, note: '这次没有用模型' }
-          const detailed = await detailFor(ctx, resolve(root), rel, {})
-          if (!detailed.ok) return { ...facts, rel, narrated: false, card: null, note: detailed.error }
-          return { ...facts, rel, narrated: true, card: detailed.detail, note: null }
-        })()
-          .then((payload) => json(res, 200, payload))
-          .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
-      },
-    },
-    {
-      kind: 'exact',
-      path: `${API}/map`,
-      handler: (req, res) => {
-        if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-        if (!requireSameOrigin(req, res)) return
-        const url = new URL(req.url ?? '/', 'http://localhost')
-        const requestPath = url.searchParams.get('path')
-        if (!requestPath) return json(res, 400, { ok: false, error: 'missing-path' })
-        const force = url.searchParams.get('refresh') === '1'
-        void scanTree(requestPath, force)
-          .then((tree) => (tree.ok ? json(res, 200, { ok: true, status: 'ready', map: legacyMap(tree), note: null }) : json(res, 200, tree)))
           .catch((error) => json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }))
       },
     },
